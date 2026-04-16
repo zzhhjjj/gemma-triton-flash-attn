@@ -378,6 +378,155 @@ def _flash_attn_gqa_kernel(
         tl.store(lse_ptrs, lse, mask=q_mask)
 
 
+# =====================================================================
+# Grouped Flash Attention GQA — multi-head fusion for K/V reuse
+#
+# Motivation: Gemma-4-E2B has GQA 8:1 (H_Q=8, H_KV=1). Every 8 Q heads read
+# the exact same K/V data, but the per-Q-head kernel above launches 8 programs
+# per (batch, Q-block) and each program independently streams K/V from HBM.
+# L2 does some of the dedup but HBM util is still 85-90% of peak, meaning
+# redundant reads are non-trivial.
+#
+# This kernel launches 1 program per GROUP_SIZE Q heads (all mapping to the
+# same KV head). K/V is loaded ONCE, then fed to GROUP_SIZE separate (Q, scores,
+# softmax, acc) computations. HBM K/V traffic is reduced by exactly GROUP_SIZE×.
+#
+# Constraint: GROUP_SIZE must divide N_Q_HEADS/N_KV_HEADS (the GQA ratio).
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_grouped_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_ob, stride_oh, stride_on, stride_od,
+    N_Q_HEADS,
+    N_KV_HEADS,
+    SEQ_LEN,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,  # Q heads processed per program; all share one KV head
+    LSE_ptr,
+    stride_lseb, stride_lseh, stride_lsen,
+    STORE_LSE: tl.constexpr,
+):
+    # Grid: (cdiv(SEQ_LEN, BLOCK_Q), B * N_Q_HEADS // GROUP_SIZE)
+    q_block_idx = tl.program_id(0)
+    bg_idx = tl.program_id(1)
+    n_groups = N_Q_HEADS // GROUP_SIZE
+    group_idx = bg_idx % n_groups
+    b_idx = bg_idx // n_groups
+
+    # First Q head in this group; all GROUP_SIZE heads [q_h_base, q_h_base+GROUP_SIZE)
+    # share a single KV head (GROUP_SIZE <= GQA ratio enforced by caller).
+    q_h_base = group_idx * GROUP_SIZE
+    kv_h_idx = q_h_base * N_KV_HEADS // N_Q_HEADS
+
+    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
+    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
+
+    q_offsets = q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_mask = q_offsets < SEQ_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # KV iteration bounds (same logic as single-head kernel)
+    if IS_CAUSAL:
+        kv_end = (q_block_idx + 1) * BLOCK_Q
+    else:
+        kv_end = SEQ_LEN
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_min = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
+        kv_loop_start = (kv_min // BLOCK_KV) * BLOCK_KV
+    else:
+        kv_loop_start = 0
+
+    # Per-head state: GROUP_SIZE separate (Q, m, l, acc). Triton's `tl.static_range`
+    # unrolls at compile time, so we use immutable tuple rebuilding (Triton doesn't
+    # support list __setitem__). Each element becomes a distinct SSA value.
+    q_blocks = ()
+    m_is = ()
+    l_is = ()
+    accs = ()
+    for g in tl.static_range(GROUP_SIZE):
+        q_h_idx = q_h_base + g
+        q_base_g = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
+        q_ptrs = q_base_g + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+        qb = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+        q_blocks = q_blocks + (qb,)
+        m_is = m_is + (tl.full([BLOCK_Q], value=-float("inf"), dtype=tl.float32),)
+        l_is = l_is + (tl.zeros([BLOCK_Q], dtype=tl.float32),)
+        accs = accs + (tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32),)
+
+    # KV loop — K/V loaded ONCE per iteration, used by all GROUP_SIZE heads.
+    for kv_start in range(kv_loop_start, kv_end, BLOCK_KV):
+        kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_offsets < SEQ_LEN
+
+        # Load K, V (shared across the whole group — this is the savings)
+        k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+        k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+        v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+        # Mask: sequence boundary + optional causal + optional sliding window
+        if IS_CAUSAL:
+            if SLIDE_SIZE > 0:
+                valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                        (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE) & \
+                        kv_mask[None, :]
+            else:
+                valid = (kv_offsets[None, :] <= q_offsets[:, None]) & kv_mask[None, :]
+        else:
+            valid = kv_mask[None, :]
+
+        # Per-head compute (unrolled). Rebuild state tuples because individual
+        # elements can't be reassigned; we create new tuples per iteration.
+        new_m_is = ()
+        new_l_is = ()
+        new_accs = ()
+        for g in tl.static_range(GROUP_SIZE):
+            scores = tl.dot(q_blocks[g], tl.trans(k_block)) * scale
+            scores = tl.where(valid, scores, -float("inf"))
+
+            block_max = tl.max(scores, axis=1)
+            new_max = tl.maximum(m_is[g], block_max)
+            if SLIDE_SIZE > 0:
+                alpha = tl.exp(tl.maximum(m_is[g], -1e20) - tl.maximum(new_max, -1e20))
+                p = tl.exp(scores - tl.maximum(new_max, -1e20)[:, None])
+            else:
+                alpha = tl.exp(m_is[g] - new_max)
+                p = tl.exp(scores - new_max[:, None])
+
+            new_l = l_is[g] * alpha + tl.sum(p, axis=1)
+            new_acc = accs[g] * alpha[:, None] + tl.dot(p.to(v_block.dtype), v_block)
+
+            new_m_is = new_m_is + (new_max,)
+            new_l_is = new_l_is + (new_l,)
+            new_accs = new_accs + (new_acc,)
+        m_is = new_m_is
+        l_is = new_l_is
+        accs = new_accs
+
+    # Normalize and store — one output per Q head
+    for g in tl.static_range(GROUP_SIZE):
+        q_h_idx = q_h_base + g
+        o_base_g = O_ptr + b_idx * stride_ob + q_h_idx * stride_oh
+        out = accs[g] / l_is[g][:, None]
+        o_ptrs = o_base_g + q_offsets[:, None] * stride_on + d_range[None, :] * stride_od
+        tl.store(o_ptrs, out, mask=q_mask[:, None])
+
+        if STORE_LSE:
+            lse = m_is[g] + tl.log(l_is[g])
+            lse_ptrs = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh + q_offsets * stride_lsen
+            tl.store(lse_ptrs, lse, mask=q_mask)
+
+
 def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
                         BLOCK_Q=None, BLOCK_KV=None,
                         BLOCK_D=None, num_warps=None, num_stages=None):
@@ -625,6 +774,132 @@ def _flash_attn_gqa_bwd_dq_kernel(
     tl.store(dq_ptrs, dq_acc.to(q_block.dtype), mask=q_mask[:, None])
 
 
+# =====================================================================
+# Fused backward: single kernel computes dQ, dK, dV together.
+#
+# Replaces (dQ_kernel + dKV_kernel + expand_reduce). Benefits:
+#  - Eliminates redundant score recomputation (Q@K^T, dO@V^T done once)
+#  - No expand buffer for dK/dV (saves GQA_RATIO× memory)
+#  - No reduce step (saves ~50μs per bwd pass)
+#  - 1 kernel launch instead of 2 (saves ~15μs)
+#
+# Cost: atomic_add contention on dK/dV. For GQA ratio R, R programs per KV
+# head contend on the same dK/dV tile. Trade-off measured in benchmark.
+#
+# Requires: dK/dV pre-zeroed by caller (atomic_add accumulates into them).
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_bwd_fused_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    LSE_ptr, Delta_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_don, stride_dod,
+    stride_dqb, stride_dqh, stride_dqn, stride_dqd,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_lseb, stride_lseh, stride_lsen,
+    stride_db, stride_dh, stride_dn,
+    N_Q_HEADS, N_KV_HEADS, SEQ_LEN,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+):
+    q_block_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+    q_h_idx = bh_idx % N_Q_HEADS
+    b_idx = bh_idx // N_Q_HEADS
+    kv_h_idx = q_h_idx * N_KV_HEADS // N_Q_HEADS
+
+    q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
+    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
+    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
+    do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
+    dq_base = dQ_ptr + b_idx * stride_dqb + q_h_idx * stride_dqh
+    # dK/dV indexed by kv_h_idx — shared via atomic_add across GQA group programs
+    dk_base = dK_ptr + b_idx * stride_dkb + kv_h_idx * stride_dkh
+    dv_base = dV_ptr + b_idx * stride_dvb + kv_h_idx * stride_dvh
+
+    q_offsets = q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_mask = q_offsets < SEQ_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # Load Q, dO, LSE, Delta — persist across KV loop
+    q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+    q_block = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    do_ptrs = do_base + q_offsets[:, None] * stride_don + d_range[None, :] * stride_dod
+    do_block = tl.load(do_ptrs, mask=q_mask[:, None], other=0.0)
+    lse_ptrs = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh + q_offsets * stride_lsen
+    lse = tl.load(lse_ptrs, mask=q_mask, other=0.0)
+    delta_ptrs = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh + q_offsets * stride_dn
+    delta = tl.load(delta_ptrs, mask=q_mask, other=0.0)
+
+    # KV iteration bounds (same as dQ kernel)
+    if IS_CAUSAL:
+        kv_end = (q_block_idx + 1) * BLOCK_Q
+    else:
+        kv_end = SEQ_LEN
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_min = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
+        kv_loop_start = (kv_min // BLOCK_KV) * BLOCK_KV
+    else:
+        kv_loop_start = 0
+
+    dq_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+
+    for kv_start in range(kv_loop_start, kv_end, BLOCK_KV):
+        kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_offsets < SEQ_LEN
+
+        k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+        k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+        v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+        # Recompute scores, P (shared between all gradient computations)
+        scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale
+        if IS_CAUSAL:
+            if SLIDE_SIZE > 0:
+                valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                        (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE) & \
+                        kv_mask[None, :]
+            else:
+                valid = (kv_offsets[None, :] <= q_offsets[:, None]) & kv_mask[None, :]
+        else:
+            valid = kv_mask[None, :]
+        scores = tl.where(valid, scores, -float("inf"))
+        p = tl.exp(scores - lse[:, None])
+
+        # dV contribution = P^T @ dO (fp32 atomic to fp32 scratch dV_fp32)
+        # (fp16 atomic_add loses precision with GQA_RATIO-way contention —
+        #  each write rounds, errors accumulate. Cast to fp16 once at end.)
+        dv_contrib = tl.dot(tl.trans(p.to(do_block.dtype)), do_block).to(tl.float32)
+        dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
+        tl.atomic_add(dv_ptrs, dv_contrib, mask=kv_mask[:, None])
+
+        # dP = dO @ V^T, then dS = P * (dP - delta)
+        dp = tl.dot(do_block, tl.trans(v_block)).to(tl.float32)
+        ds = p * (dp - delta[:, None])
+        ds = tl.where(valid, ds, 0.0)
+
+        # dQ += dS @ K (scale applied outside loop)
+        dq_acc += tl.dot(ds.to(k_block.dtype), k_block).to(tl.float32)
+
+        # dK contribution = scale * dS^T @ Q (fp32 atomic to dK_fp32)
+        dk_contrib = (tl.dot(tl.trans(ds.to(q_block.dtype)), q_block).to(tl.float32)) * scale
+        dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
+        tl.atomic_add(dk_ptrs, dk_contrib, mask=kv_mask[:, None])
+
+    dq_acc *= scale
+    dq_ptrs = dq_base + q_offsets[:, None] * stride_dqn + d_range[None, :] * stride_dqd
+    tl.store(dq_ptrs, dq_acc.to(q_block.dtype), mask=q_mask[:, None])
+
+
 @triton.jit
 def _flash_attn_gqa_bwd_dkv_kernel(
     Q_ptr, K_ptr, V_ptr, dO_ptr, dK_ptr, dV_ptr,
@@ -762,6 +1037,137 @@ def _flash_attn_gqa_bwd_dkv_kernel(
 
 
 # =====================================================================
+# Packed dKV kernel — pack-GQA style (inspired by flash-attn pack_gqa=True).
+#
+# Grid is (cdiv(N, BKV), B * N_KV_HEADS) — one program per KV block, NOT per
+# Q head. Inner loop iterates over all GQA_RATIO Q heads mapping to this KV
+# head and accumulates their contributions into a single dk_acc / dv_acc.
+#
+# Compared to _flash_attn_gqa_bwd_dkv_kernel (split per-Q-head + reduce):
+#   + No expand buffer (saves GQA_RATIO× memory: no dk_expanded/dv_expanded)
+#   + No reduce step (saves the view+sum kernel)
+#   + K, V loaded ONCE per program (vs GQA_RATIO× across split programs)
+#   - GQA_RATIO× longer inner loop (but same total work)
+#   - GQA_RATIO× fewer programs in grid — risks SM under-utilisation at short N
+#
+# Register budget: identical to split dKV (same dk_acc/dv_acc/K/V live set).
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_bwd_dkv_packed_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, dK_ptr, dV_ptr,
+    LSE_ptr, Delta_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_don, stride_dod,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_lseb, stride_lseh, stride_lsen,
+    stride_db, stride_dh, stride_dn,
+    N_Q_HEADS, N_KV_HEADS, SEQ_LEN,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    GQA_RATIO: tl.constexpr,  # N_Q_HEADS // N_KV_HEADS
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+):
+    # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS)
+    kv_block_idx = tl.program_id(0)
+    bkvh_idx = tl.program_id(1)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
+    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
+    # dK/dV indexed by KV head — one program owns this tile entirely
+    dk_base = dK_ptr + b_idx * stride_dkb + kv_h_idx * stride_dkh
+    dv_base = dV_ptr + b_idx * stride_dvb + kv_h_idx * stride_dvh
+
+    kv_offsets = kv_block_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
+    kv_mask = kv_offsets < SEQ_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # Load K, V once — reused across all GQA_RATIO Q heads
+    k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+    k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+    v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+    v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+    # Single accumulator sums contributions from all Q heads in the GQA group
+    dk_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+    dv_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    # Q iteration bounds (same as split kernel — derived from KV block position)
+    if IS_CAUSAL:
+        q_start = (kv_block_idx * BLOCK_KV // BLOCK_Q) * BLOCK_Q
+    else:
+        q_start = 0
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_last = kv_block_idx * BLOCK_KV + BLOCK_KV - 1
+        q_max = kv_last + SLIDE_SIZE - 1
+        q_loop_end = ((q_max // BLOCK_Q) + 1) * BLOCK_Q
+        q_loop_end = tl.minimum(SEQ_LEN, q_loop_end)
+    else:
+        q_loop_end = SEQ_LEN
+
+    # Outer loop: Q heads (unrolled). Each Q head's contribution accumulates
+    # into the SAME dk_acc/dv_acc — this replaces the expand+reduce pattern.
+    for qh_offset in tl.static_range(GQA_RATIO):
+        q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
+        q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
+        do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
+        lse_base = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh
+        delta_base = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh
+
+        # Inner loop: Q blocks for this Q head
+        for q_start_pos in range(q_start, q_loop_end, BLOCK_Q):
+            q_offsets = q_start_pos + tl.arange(0, BLOCK_Q)
+            q_mask_local = q_offsets < SEQ_LEN
+
+            q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+            q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
+            do_ptrs = do_base + q_offsets[:, None] * stride_don + d_range[None, :] * stride_dod
+            do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
+            lse = tl.load(lse_base + q_offsets * stride_lsen, mask=q_mask_local, other=0.0)
+            delta = tl.load(delta_base + q_offsets * stride_dn, mask=q_mask_local, other=0.0)
+
+            scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale
+            if IS_CAUSAL:
+                if SLIDE_SIZE > 0:
+                    valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None] & \
+                            (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE)
+                else:
+                    valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None]
+            else:
+                valid = kv_mask[None, :] & q_mask_local[:, None]
+            scores = tl.where(valid, scores, -float("inf"))
+            p = tl.exp(scores - lse[:, None])
+
+            dv_acc += tl.dot(tl.trans(p.to(do_block.dtype)), do_block).to(tl.float32)
+
+            dp = tl.dot(do_block, tl.trans(v_block)).to(tl.float32)
+            ds = p * (dp - delta[:, None])
+            ds = tl.where(valid, ds, 0.0)
+
+            dk_acc += tl.dot(tl.trans(ds.to(q_block.dtype)), q_block).to(tl.float32)
+
+    dk_acc *= scale
+
+    # Direct store — no atomic (only this program writes this tile),
+    # no reduce (all Q heads already summed into acc).
+    dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
+    dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
+    tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
+    tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+
+
+# =====================================================================
 # Autograd Function wrapping forward + backward
 # =====================================================================
 
@@ -862,55 +1268,46 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             num_warps=num_warps_bw, num_stages=2,
         )
 
-        # --- dK, dV kernel (split: per-Q-head, then reduce) ---
-        # Allocate per-Q-head dk/dv, then sum across GQA group.
-        # Atomic-reduce mode (fuse reduce into dKV via atomic_add) was tested
-        # but consistently ~3-5% slower at medium-long N due to GQA_RATIO-way
-        # contention, with no win at short N (reduce kernel is already ~50us).
-        # The kernel still supports ATOMIC_REDUCE=True via constexpr for future use.
-        dk_expanded = torch.empty(B, H_Q, N, D, dtype=q.dtype, device=q.device)
-        dv_expanded = torch.empty(B, H_Q, N, D, dtype=q.dtype, device=q.device)
-
-        # D-specific tuning (sweeps across N=1K-16K + slide={0, 1024}):
-        #   D=512: (BQ=16, BKV=32, w=8) — register pressure pins BQ=16
-        #   D=256: (BQ=64, BKV=32, w=4) — 2x headroom allows 4x larger BQ, -35% bwd time
+        # --- dK, dV kernel (packed: KV-major, inline GQA Q-head loop) ---
+        # Inspired by flash-attention's pack_gqa=True mode:
+        #   Grid = (cdiv(N, BKV), B × H_KV) — one program per KV block.
+        #   Inner loop iterates all GQA_RATIO Q heads, accumulating into a
+        #   single dk_acc/dv_acc per program → direct write, no expand buffer,
+        #   no atomic, no reduce kernel.
+        # Saves GQA_RATIO × (B × H_KV × N × D × 2 × 2) bytes vs the old
+        # split+reduce design (≈1 GB at Gemma-4-E2B N=32K).
+        #
+        # The old split path (_flash_attn_gqa_bwd_dkv_kernel with expand+reduce)
+        # is kept in the source for reference but no longer on the hot path.
         if D >= 512:
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 16, 8
         else:
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
         BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))
         BLOCK_Q_DKV = min(BLOCK_Q_DKV, triton.next_power_of_2(N))
-        grid_dkv = (triton.cdiv(N, BLOCK_KV_DKV), B * H_Q)
+        grid_dkv = (triton.cdiv(N, BLOCK_KV_DKV), B * H_KV)
 
-        _flash_attn_gqa_bwd_dkv_kernel[grid_dkv](
-            q, k, v, do, dk_expanded, dv_expanded, lse, delta,
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+
+        _flash_attn_gqa_bwd_dkv_packed_kernel[grid_dkv](
+            q, k, v, do, dk, dv, lse, delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            dk_expanded.stride(0), dk_expanded.stride(1), dk_expanded.stride(2), dk_expanded.stride(3),
-            dv_expanded.stride(0), dv_expanded.stride(1), dv_expanded.stride(2), dv_expanded.stride(3),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
             lse.stride(0), lse.stride(1), lse.stride(2),
             delta.stride(0), delta.stride(1), delta.stride(2),
             N_Q_HEADS=H_Q, N_KV_HEADS=H_KV, SEQ_LEN=N,
             HEAD_DIM=D, scale=scale,
             BLOCK_Q=BLOCK_Q_DKV, BLOCK_KV=BLOCK_KV_DKV,
+            GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
-            ATOMIC_REDUCE=False,
             num_warps=num_warps_dkv, num_stages=2,
         )
-
-        # Reduce across GQA group: (B, H_Q, N, D) → (B, H_KV, N, D)
-        # Pairwise add is ~15% faster than view+sum at GQA_RATIO=2 (D=256 case).
-        if GQA_RATIO == 2:
-            dk_r = dk_expanded.view(B, H_KV, 2, N, D)
-            dv_r = dv_expanded.view(B, H_KV, 2, N, D)
-            dk = dk_r[:, :, 0] + dk_r[:, :, 1]
-            dv = dv_r[:, :, 0] + dv_r[:, :, 1]
-        else:
-            dk = dk_expanded.view(B, H_KV, GQA_RATIO, N, D).sum(dim=2)
-            dv = dv_expanded.view(B, H_KV, GQA_RATIO, N, D).sum(dim=2)
 
         return dq, dk, dv, None, None
 
@@ -1171,6 +1568,34 @@ if __name__ == "__main__":
             dk_ok = torch.allclose(args_ref[1].grad, args_tri[1].grad, atol=1e-1, rtol=1e-1)
             dv_ok = torch.allclose(args_ref[2].grad, args_tri[2].grad, atol=1e-1, rtol=1e-1)
             print(f"  N={N:>5}: dQ={'OK' if dq_ok else 'FAIL'} dK={'OK' if dk_ok else 'FAIL'} dV={'OK' if dv_ok else 'FAIL'}")
+
+    elif mode == "swa_bwd":
+        SLIDE = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
+        print("=== SWA Fwd+Bwd Benchmark (slide=%d, H_Q=32, H_KV=16, D=256) ===" % SLIDE)
+        print()
+
+        def sdpa_causal_fwd_bwd(q, k, v):
+            ratio = q.shape[1] // k.shape[1]
+            k_exp = k.repeat_interleave(ratio, dim=1)
+            v_exp = v.repeat_interleave(ratio, dim=1)
+            out = torch.nn.functional.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+            out.sum().backward()
+            q.grad = k.grad = v.grad = None
+
+        def triton_swa_fwd_bwd(q, k, v):
+            out = flash_attn_gqa_train(q, k, v, causal=True, slide_size=SLIDE)
+            out.sum().backward()
+            q.grad = k.grad = v.grad = None
+
+        print("%6s | %16s | %15s | %8s" % ("N", "SDPA-causal (ms)", "Triton-SWA (ms)", "Speedup"))
+        print("-" * 56)
+        for N in [512, 1024, 2048, 4096, 8192]:
+            q = torch.randn(1, 32, N, 256, dtype=torch.float16, device="cuda").requires_grad_(True)
+            k = torch.randn(1, 16, N, 256, dtype=torch.float16, device="cuda").requires_grad_(True)
+            v = torch.randn(1, 16, N, 256, dtype=torch.float16, device="cuda").requires_grad_(True)
+            t_sdpa   = benchmark_fn(sdpa_causal_fwd_bwd, q, k, v, warmup=5, rep=20)
+            t_triton = benchmark_fn(triton_swa_fwd_bwd,  q, k, v, warmup=5, rep=20)
+            print("%6d | %16.3f | %15.3f | %7.2fx" % (N, t_sdpa, t_triton, t_sdpa/t_triton))
 
     else:
         # Original MHA benchmark
