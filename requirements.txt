@@ -1,0 +1,6 @@
+transformers==5.5.4
+torch==2.9.1
+triton>=3.0
+accelerate
+safetensors
+huggingface-hub

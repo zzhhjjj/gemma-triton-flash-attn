@@ -1,0 +1,47 @@
+# Python build / runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+wheels/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Testing / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local dev artifacts (Claude agent workflow — not for public package)
+claude.md
+context/
+skills/
+
+# Profiling output
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+/tmp/

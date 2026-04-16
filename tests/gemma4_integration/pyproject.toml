@@ -1,0 +1,16 @@
+[project]
+name = "gemma4-integration"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.9.1",
+    "transformers==5.5.4",
+    "triton>=3.0",
+    "accelerate",
+    "safetensors",
+    "huggingface-hub",
+    "gemma-triton-flash-attn",
+]
+
+[tool.uv.sources]
+gemma-triton-flash-attn = { workspace = true }

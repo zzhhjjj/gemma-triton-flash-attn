@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemma-triton-flash-attn"
+version = "0.1.0"
+description = "Triton Flash Attention for Gemma4-style GQA with large HEAD_DIM and sliding window support"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "haojun" }]
+keywords = ["triton", "attention", "flash-attention", "gqa", "sliding-window", "gemma"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "torch>=2.0",
+    "triton>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-benchmark"]
+
+[project.urls]
+Homepage = "https://github.com/user/gemma-triton-flash-attn"
+
+[tool.setuptools]
+packages = ["gemma_triton_flash_attn"]
+
+[tool.setuptools.package-dir]
+gemma_triton_flash_attn = "flash_attn"
+
+[tool.uv.workspace]
+members = [
+    "tests/gemma4_integration",
+]
