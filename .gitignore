@@ -36,9 +36,9 @@ htmlcov/
 Thumbs.db
 
 # Local dev artifacts (Claude agent workflow — not for public package)
-claude.md
-context/
-skills/
+# claude.md
+# context/
+# skills/
 
 # Profiling output
 *.nsys-rep
