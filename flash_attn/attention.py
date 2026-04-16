@@ -281,55 +281,71 @@ def _flash_attn_gqa_kernel(
     d_range = tl.arange(0, HEAD_DIM)
 
     # Determine KV iteration range.
-    # IS_CAUSAL: iterate up to the last Q position in this block.
-    # SLIDE_SIZE: skip KV blocks entirely outside the attention window.
     if IS_CAUSAL:
         kv_end = (q_block_idx + 1) * BLOCK_Q
     else:
         kv_end = SEQ_LEN
 
     if IS_CAUSAL and SLIDE_SIZE > 0:
-        # Earliest KV position any query in this Q block can attend to:
-        #   q_min = q_block_idx * BLOCK_Q
-        #   kv_min = q_min - SLIDE_SIZE + 1
-        # Clamp to 0 before rounding down to block boundary.
         kv_min = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
         kv_loop_start = (kv_min // BLOCK_KV) * BLOCK_KV
     else:
         kv_loop_start = 0
 
-    # Accumulators for online softmax
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
     m_i = tl.full([BLOCK_Q], value=-float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
     acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
 
-    # Iterate over KV blocks
-    for kv_start in range(kv_loop_start, kv_end, BLOCK_KV):
+    # For causal without SWA, split the KV loop into an unmasked off-diagonal
+    # phase (queries all see all keys in block) and a masked diagonal phase.
+    # FA2/FA3 use the same pattern. At HEAD_DIM=512 the register pressure from
+    # the two-loop code makes this a net loss (matmul already dominates, mask
+    # overhead is negligible), so skip the split there.
+    USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)
+    if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT:
+        kv_end_unmasked = (q_block_idx * BLOCK_Q) // BLOCK_KV * BLOCK_KV
+    else:
+        kv_end_unmasked = kv_loop_start  # skip unmasked phase
+
+    # Phase 1: unmasked KV iterations (off-diagonal, dense) — no mask op.
+    for kv_start in range(kv_loop_start, kv_end_unmasked, BLOCK_KV):
+        kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
+        q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+        q_chunk = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+        k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+        k_chunk = tl.load(k_ptrs)
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
+
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        alpha = tl.math.exp2(m_i - new_max)
+        p = tl.math.exp2(scores - new_max[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+        v_block = tl.load(v_ptrs)
+        acc += tl.dot(p.to(v_block.dtype), v_block)
+
+        m_i = new_max
+
+    # Phase 2: masked KV iterations (diagonal + seq boundary + SWA).
+    for kv_start in range(kv_end_unmasked, kv_end, BLOCK_KV):
         kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
         kv_mask = kv_offsets < SEQ_LEN
 
-        # --- Score computation: tile over HEAD_DIM in BLOCK_D chunks ---
-        # Loads Q and K in (*, BLOCK_D) chunks so they are never fully
-        # materialised together — peak register pressure stays bounded.
-        scores = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        for d_start in range(0, HEAD_DIM, BLOCK_D):
-            d_offs = d_start + tl.arange(0, BLOCK_D)
-            q_chunk = tl.load(
-                q_base + q_offsets[:, None] * stride_qn + d_offs[None, :] * stride_qd,
-                mask=q_mask[:, None], other=0.0,
-            )
-            k_chunk = tl.load(
-                k_base + kv_offsets[:, None] * stride_kn + d_offs[None, :] * stride_kd,
-                mask=kv_mask[:, None], other=0.0,
-            )
-            scores += tl.dot(q_chunk, tl.trans(k_chunk))
+        q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+        q_chunk = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+        k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+        k_chunk = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
 
-        scores *= scale
-
-        # Mask: sequence boundary + optional causal + optional sliding window
         if IS_CAUSAL:
             if SLIDE_SIZE > 0:
-                # Causal + sliding window: j <= q_i AND q_i - j < SLIDE_SIZE
                 valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
                         (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE) & \
                         kv_mask[None, :]
@@ -339,41 +355,35 @@ def _flash_attn_gqa_kernel(
             valid = kv_mask[None, :]
         scores = tl.where(valid, scores, -float("inf"))
 
-        # --- Online softmax update ---
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(m_i, block_max)
         if SLIDE_SIZE > 0:
-            # SWA: a KV block can be fully outside the window for some Q rows
-            # while m_i is still -inf (no valid KV seen yet). Without clamp,
-            # exp(-inf - (-inf)) = exp(nan) = nan pollutes acc.
-            alpha = tl.exp(tl.maximum(m_i, -1e20) - tl.maximum(new_max, -1e20))
-            p = tl.exp(scores - tl.maximum(new_max, -1e20)[:, None])
+            safe_new = tl.maximum(new_max, -1e20)
+            alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
+            p = tl.math.exp2(scores - safe_new[:, None])
         else:
-            # Full / causal: KV loop iterates monotonically from 0, every Q row
-            # sees valid KV on the first iteration, so m_i finite after step 1.
-            alpha = tl.exp(m_i - new_max)
-            p = tl.exp(scores - new_max[:, None])
+            alpha = tl.math.exp2(m_i - new_max)
+            p = tl.math.exp2(scores - new_max[:, None])
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
-        # --- V accumulation: full HEAD_DIM load ---
         v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
         v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
         acc += tl.dot(p.to(v_block.dtype), v_block)
 
         m_i = new_max
 
-    # Final normalization
     acc = acc / l_i[:, None]
 
-    # Store output
     o_ptrs = o_base + q_offsets[:, None] * stride_on + d_range[None, :] * stride_od
     tl.store(o_ptrs, acc, mask=q_mask[:, None])
 
-    # Store logsumexp for backward pass
+    # Convert LSE back to natural-log domain for bwd consumption: m_i is log2,
+    # so lse_natural = m_i * ln(2) + ln(l_i).
     if STORE_LSE:
-        lse = m_i + tl.log(l_i)
+        LN2: tl.constexpr = 0.6931471805599453
+        lse = m_i * LN2 + tl.log(l_i)
         lse_ptrs = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh + q_offsets * stride_lsen
         tl.store(lse_ptrs, lse, mask=q_mask)
 
@@ -734,18 +744,21 @@ def _flash_attn_gqa_bwd_dq_kernel(
 
     dq_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
 
+    # Convert LSE to log2 domain once so we can use tl.math.exp2 inside the loop.
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+    lse_log2 = lse * LOG2E
+
     for kv_start in range(kv_loop_start, kv_end, BLOCK_KV):
         kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
         kv_mask = kv_offsets < SEQ_LEN
 
-        # Load K, V
         k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
         k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
         v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
         v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
 
-        # Recompute scores and attention weights
-        scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale
+        scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
         if IS_CAUSAL:
             if SLIDE_SIZE > 0:
                 valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
@@ -756,15 +769,12 @@ def _flash_attn_gqa_bwd_dq_kernel(
         else:
             valid = kv_mask[None, :]
         scores = tl.where(valid, scores, -float("inf"))
-        p = tl.exp(scores - lse[:, None])
+        p = tl.math.exp2(scores - lse_log2[:, None])
 
-        # dP = dO @ V^T
         dp = tl.dot(do_block, tl.trans(v_block)).to(tl.float32)
-        # dS = P * (dP - D)
         ds = p * (dp - delta[:, None])
         ds = tl.where(valid, ds, 0.0)
 
-        # dQ += scale * dS @ K
         dq_acc += tl.dot(ds.to(k_block.dtype), k_block).to(tl.float32)
 
     dq_acc *= scale
@@ -1100,6 +1110,9 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     dk_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
     dv_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
 
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
     # Q iteration bounds (same as split kernel — derived from KV block position)
     if IS_CAUSAL:
         q_start = (kv_block_idx * BLOCK_KV // BLOCK_Q) * BLOCK_Q
@@ -1134,8 +1147,9 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
             do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
             lse = tl.load(lse_base + q_offsets * stride_lsen, mask=q_mask_local, other=0.0)
             delta = tl.load(delta_base + q_offsets * stride_dn, mask=q_mask_local, other=0.0)
+            lse_log2 = lse * LOG2E
 
-            scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale
+            scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
             if IS_CAUSAL:
                 if SLIDE_SIZE > 0:
                     valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
@@ -1147,7 +1161,7 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
             else:
                 valid = kv_mask[None, :] & q_mask_local[:, None]
             scores = tl.where(valid, scores, -float("inf"))
-            p = tl.exp(scores - lse[:, None])
+            p = tl.math.exp2(scores - lse_log2[:, None])
 
             dv_acc += tl.dot(tl.trans(p.to(do_block.dtype)), do_block).to(tl.float32)
 

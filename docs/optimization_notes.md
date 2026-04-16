@@ -1,11 +1,69 @@
 # Optimization notes
 
 This document records the optimization strategies that were implemented and
-measured. One ("pack-GQA dKV") succeeded and is now the default backward
-path; two others ("multi-head fusion fwd", "atomic fused bwd") turned out
-worse than the baseline and are kept in source only as cautionary reference.
+measured. Wins that shipped: pack-GQA dKV kernel, softmax `exp2`, split
+causal-mask loop. Dead ends kept in source for reference: multi-head fusion
+fwd, atomic fused bwd.
 
 Further quantitative tables live in [`../context/baseline.md`](../context/baseline.md).
+
+## ✅ Softmax `exp2` with folded log2(e) scale
+
+**Idea (from FA2/FA3).** `tl.exp(x)` on Hopper expands to several PTX
+instructions; `tl.math.exp2(x)` maps to the single `ex2.approx.ftz.f32`
+instruction. Substitution requires staying in log2 domain:
+
+1. Fold `log2(e) / sqrt(D)` into the score scale (applied after the QK^T matmul).
+2. Track the running max `m_i` in log2 domain and use `tl.math.exp2` for the
+   softmax rescale + normalization.
+3. Convert back at store time: `lse_natural = m_i * ln(2) + ln(l_i)` so bwd
+   kernels consume the same natural-log LSE as before. (Bwd kernels then
+   redo the log2 conversion internally — `lse_log2 = lse * log2(e)`.)
+
+**Results on full-causal forward, D=512, B=1, H_Q=32, H_KV=4 (small):**
+modest at D=512 because the per-tile matmul dominates. Bigger wins at
+smaller D and on SWA where softmax is a larger fraction of runtime.
+
+**Microbench:** pure `tl.exp` vs `tl.math.exp2` loop: **1.13× faster** per op.
+
+## ✅ Split causal-mask loop (off-diagonal unmasked + diagonal masked)
+
+**Idea (from FA2/FA3).** For causal attention without SWA, only the
+diagonal block `kv_b == q_b` needs the `kv_pos ≤ q_pos` check. All KV
+blocks with `kv_b < q_b` are fully unmasked. The current Triton wrapper
+splits the KV loop into two phases:
+
+- Phase 1 (off-diagonal): `range(0, kv_end_unmasked, BLOCK_KV)` with no
+  `tl.where` and no mask in `tl.load`. Even K/V loads skip the mask arg.
+- Phase 2 (diagonal + seq-end): runs the mask path.
+
+**Results at D=128, H_Q=32, H_KV=8, full causal FP16, H100:**
+
+| N | Before (ms) | After (ms) | Speedup |
+|---|-------------|-----------|---------|
+| 4,096 | 0.69 | 0.48 | **1.45×** |
+| 16,384 | 8.08 | 5.57 | **1.45×** |
+| 32,768 | 31.34 | 20.89 | **1.50×** |
+
+This takes Triton from 0.88× of SDPA to **1.31× of SDPA** at D=128 — crossing
+above the cuDNN/FA3 baseline on FA's home turf.
+
+**Compile-time guard at D≥512:** the two-loop code bloats register usage
+enough that on D=512 the gain from skipping mask ops is lost to spills
+(matmul is already the bottleneck). The wrapper sets
+`USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)`, so D=512 uses a single-loop
+body while D<512 uses the split.
+
+## Remaining gap to FA2/FA3
+
+FA2/FA3 still roughly 1.5–2× ahead on D=128 (~650 TFLOPS/s vs our
+421 TFLOPS/s). Closing this gap needs CUDA-level tools Triton exposes only
+partially: explicit warp specialization (producer/consumer warps), async
+TMA loads, cluster barriers, software-pipelined mbarrier phases. The
+upstream `flash-attention/flash_attn/cute/` uses those primitives via
+CuTeDSL. Same story on D=512 where the gap is smaller (FA2 doesn't even
+support D=512 natively; FA3 tops out at D=256) but the architectural ceiling
+for Triton holds.
 
 ## ✅ Pack-GQA style backward (default)
 

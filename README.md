@@ -12,11 +12,13 @@ cuDNN / FlashAttention-3 paths either miss the config or lack SWA support.
 
 | Benchmark | Config | Peak speedup / saving |
 |-----------|--------|-----------------------|
-| **Kernel fwd** (full causal, D=512, GQA 8:1) | N=32K, FP16 | **2.15× vs SDPA** |
-| **Kernel fwd+bwd** (full causal, D=512, GQA 8:1) | N=4K, FP16 | **2.12× vs SDPA** (≥1.9× across all N) |
+| **Kernel fwd** (full causal, D=512, GQA 8:1) | N=32K, FP16 | **2.19× vs SDPA** |
+| **Kernel fwd+bwd** (full causal, D=512, GQA 8:1) | N=4K, FP16 | **2.18× vs SDPA** (≥1.96× across all N) |
 | **Gemma-4-E2B E2E forward** | N=16K, BF16 | **4.51× vs SDPA** |
 | **Peak memory** (Gemma-4-E2B fwd) | N=16K, BF16 | **-24%** (22.0 GB → 16.7 GB) |
 | **Max runnable context** (Gemma-4-E2B, 80 GB H100) | — | **32K vs 16K** (SDPA OOMs at 32K) |
+| (bonus) Kernel fwd **D=128** GQA 4:1 | N=32K, FP16 | **1.31× vs SDPA** (421 TFLOPS/s) |
+| (bonus) Kernel fwd **D=256 SWA** slide=1024 | N=32K, FP16 | **18.3× vs SDPA** |
 
 ### Speed — full causal attention (the SDPA slow-path config)
 
@@ -26,14 +28,20 @@ Gemma4's global attention layer uses `HEAD_DIM=512, H_Q=32, H_KV=4`, which
 falls off SDPA's cuDNN / FlashAttention-3 fast-paths — effective throughput
 caps at ~100 TFLOPS/s on the forward pass and ~50 TFLOPS/s on fwd+bwd. Our
 Triton kernel doubles that to ~190 TFLOPS/s fwd, ~95 TFLOPS/s fwd+bwd —
-**roughly 2× SDPA throughput at every sequence length**, widening to 2.15×
-at N=32K where SDPA hits 90 TFLOPS/s while Triton holds 190.
+**roughly 2× SDPA throughput at every sequence length**, peaking at 2.19×
+at N=32K (190 vs 86 TFLOPS/s).
 
 Both implementations are charged for the same dense-causal FLOPs
 (`2·B·H·N²·D` fwd, `7·B·H·N²·D` fwd+bwd) — speedup ratios in ms and TFLOPS
 match exactly. Attention is memory-bandwidth-bound, so both curves sit well
 below the 990 TFLOPS H100 ceiling; the win is in how tightly we schedule
 HBM traffic.
+
+The kernel uses `tl.math.exp2` (folded `log2(e)` into the softmax scale) and
+a split-loop causal mask (off-diagonal blocks skip the mask op entirely) —
+both borrowed from FA2. At D=128 this lifts us past SDPA to 421 TFLOPS/s;
+at D=512 the matmul is already dominant so the softmax optimizations are
+worth only a few percent. See [`docs/optimization_notes.md`](docs/optimization_notes.md).
 
 ![Gemma-4-E2B E2E forward latency](benchmarks/e2e_latency_vs_sdpa.png)
 
