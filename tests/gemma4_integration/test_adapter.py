@@ -27,7 +27,16 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from gemma_triton_flash_attn import register_triton_attention, triton_gqa_attention
+from gemma_triton_flash_attn import (
+    patch_transformers_5_5_4_flash_attn_key,
+    register_triton_attention,
+    triton_gqa_attention,
+)
+
+# transformers 5.5.4 raises KeyError('flash_attn') on any config load the first
+# time it probes installed packages. Apply the upstream fix before anything else
+# in this module touches transformers internals.
+patch_transformers_5_5_4_flash_attn_key()
 
 
 # =====================================================================

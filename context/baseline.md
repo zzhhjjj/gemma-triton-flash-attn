@@ -812,6 +812,64 @@ Baseline:     SDPA full-causal（没有原生 SWA backward，用 full-causal 作
 
 ---
 
+### Pack-GQA dKV Block Size Re-sweep for D=512 (2026-04-17)
+
+**动机**：Pack-GQA 切换时沿用旧 split kernel 的 `(BKV=32, BQ=16, w=8)` 配置，但 pack-GQA
+的 register / shmem 模型不同：dk_acc/dv_acc 尺寸 = BKV × D × fp32 (**BQ 不进 accumulator**)。
+旧常识 "BQ=32 灾难 spill" 仅对 per-Q-head split 路径成立。
+
+**Breakdown profile（旧默认 BKV=32, BQ=16, w=8）揭示 dKV 占 fwd+bwd 62-69%**：
+
+| N | delta | dQ | dKV | tri bwd | vs SDPA |
+|---|-------|----|----|---------|---------|
+| 1K | 0.05ms | 0.41ms | 1.64ms | 2.02ms | 2.22× |
+| 4K | 0.11ms | 4.76ms | 12.90ms | 17.71ms | 2.30× |
+| 16K | 0.37ms | 72.6ms | 200.2ms | 273.2ms | 1.98× |
+| 32K | 0.71ms | 289.9ms | 798.2ms | 1089.3ms | 1.93× |
+
+**Sweep @ N=4K**: 36 configs (BQ × BKV × warps × stages)，H100 shmem=232KB 限制
+
+| BQ | BKV | w | s | time (ms) | vs 旧默认 |
+|----|-----|---|---|-----------|-----------|
+| 16 | 32 | 8 | 2 | 13.126 | 1.00× (旧默认) |
+| 16 | 16 | 4 | 2 | 13.211 | 0.99× |
+| 32 | * | * | * | 178-282 | 0.05-0.07× (BKV<64 全灾难) |
+| 64 | 16 | 8 | 2 | 11.622 | 1.13× |
+| **64** | **16** | **4** | **2** | **9.355** | **1.40× 最优** |
+| 64 | 32 | 8 | 2 | 19.985 | 0.66× |
+| 64 | 64 | * | * | OOM | — |
+| 128 | * | * | * | OOM | shmem 超限 |
+
+**胜者：(BKV=16, BQ=64, w=4, s=2)**
+- BKV=16 让 dk_acc+dv_acc 从 128KB 减到 64KB → shmem 腾出给大 BQ
+- BQ=64 让 inner Q loop 迭代数减 4×，Q/dO tile 复用更充分
+- num_warps=4 胜 8（D=256 bwd 同样结论，bwd kernel compute 较轻 8 warps 过度）
+
+**Top-3 验证 @ N=16K**（确认 scaling 一致）:
+| (BQ, BKV, w) | @N=4K | @N=16K |
+|--------------|-------|--------|
+| (64, 16, 4)  | 9.36  | 141.7 |
+| (64, 16, 8)  | 11.62 | 172.9 |
+| (16, 32, 8)  | 13.13 | 200.5 |
+
+**切换后 breakdown（新默认 BKV=16, BQ=64, w=4）**:
+
+| N | delta | dQ | dKV | tri bwd | tri fwd+bwd | vs SDPA fwd+bwd |
+|---|-------|----|----|---------|-------------|-----------------|
+| 1K | 0.05ms | 0.44ms | **1.02ms** | **1.41ms** | **1.77ms** | 2.08× → **2.83×** |
+| 4K | 0.11ms | 4.75ms | **9.30ms** | **14.12ms** | **17.47ms** | 2.18× → **2.66×** |
+| 16K | 0.37ms | 72.6ms | **141.8ms** | **214.4ms** | **262.1ms** | 1.96× → **2.42×** |
+| 32K | 0.71ms | 289.9ms | **562.8ms** | **853.3ms** | **1048.4ms** | 2.31× → **2.40×** |
+
+**dKV 相对占比**：62-69% → 54-58%（仍是最大头，但 27-29% 时间消失）
+**正确性**：8 个 shape × {causal, non-causal} 全 PASS (fwd 1e-3, grad 8e-3 atol)
+**未回退**：D=256 分支未动，SWA 未受影响
+
+**修改**：`attention.py:1296-1299` 三行常量
+**脚本**：`benchmarks/bwd_breakdown.py` + `benchmarks/dkv_sweep_D512.py`
+
+---
+
 ### Pack-GQA dKV Kernel (2026-04-16)
 
 **来源**：借鉴 `/mnt/bn/ic-aip/haojun/code/flash-attention/flash_attn/cute/pack_gqa.py`

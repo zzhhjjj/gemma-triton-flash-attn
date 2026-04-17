@@ -1,39 +1,36 @@
-=== 1. Kernel-only SWA forward ===
-  [kernel-fwd] N=  1024: sdpa=0.16ms triton=0.15ms  1.03x
-  [kernel-fwd] N=  2048: sdpa=0.38ms triton=0.27ms  1.41x
-  [kernel-fwd] N=  4096: sdpa=1.12ms triton=0.49ms  2.27x
-  [kernel-fwd] N=  8192: sdpa=3.97ms triton=0.98ms  4.04x
-  [kernel-fwd] N= 16384: sdpa=15.70ms triton=2.03ms  7.74x
-  [kernel-fwd] N= 32768: sdpa=64.07ms triton=4.14ms  15.49x
-  [kernel-fwd] N= 65536: sdpa=281.66ms triton=8.12ms  34.67x
-  [kernel-fwd] N=131072: sdpa=1140.80ms triton=14.93ms  76.42x
+=== 1. Kernel-only full-causal forward (Gemma4 full config) ===
+  [kernel-fwd] N=  1024: sdpa=0.44652798771858215 triton=0.32396799325942993  1.378308959555173
+  [kernel-fwd] N=  2048: sdpa=1.4345920085906982 triton=0.9107199907302856  1.5752284161900647
+  [kernel-fwd] N=  4096: sdpa=5.176383972167969 triton=3.2216639518737793  1.6067423696246432
+  [kernel-fwd] N=  8192: sdpa=20.292831420898438 triton=11.513343811035156  1.7625488957819913
+  [kernel-fwd] N= 16384: sdpa=85.55705261230469 triton=44.70057678222656  1.9140033254855697
+  [kernel-fwd] N= 32768: sdpa=403.4729309082031 triton=184.8665008544922  2.1825096977725313
 
-=== 2. Kernel-only SWA fwd+bwd ===
-  [kernel-f+b] N=  1024: sdpa=0.6076160073280334  triton=0.6782400012016296  0.8958716770634694
-  [kernel-f+b] N=  2048: sdpa=1.5585919618606567  triton=1.2196160554885864  1.2779365726177443
-  [kernel-f+b] N=  4096: sdpa=4.6748480796813965  triton=2.4562559127807617  1.9032414559722872
-  [kernel-f+b] N=  8192: sdpa=15.79526424407959  triton=4.953343868255615  3.1888083412311325
-  [kernel-f+b] N= 16384: sdpa=59.1407356262207  triton=10.102815628051758  5.8538864613156845
-  [kernel-f+b] N= 32768: sdpa=236.34605407714844  triton=20.309471130371094  11.637233316416248
+=== 2. Kernel-only full-causal fwd+bwd (Gemma4 full config) ===
+  [kernel-f+b] N=  1024: sdpa=4.979775905609131  triton=1.793984055519104  2.7758194897491393
+  [kernel-f+b] N=  2048: sdpa=14.546879768371582  triton=4.955423831939697  2.9355470413269393
+  [kernel-f+b] N=  4096: sdpa=46.923072814941406  triton=17.587007522583008  2.668053263449665
+  [kernel-f+b] N=  8192: sdpa=167.7178497314453  triton=66.74432373046875  2.512840648573119
+  [kernel-f+b] N= 16384: sdpa=636.392578125  triton=261.88824462890625  2.430015822309106
 
 === 3. Gemma-4-E2B E2E forward ===
 [load] Gemma-4-E2B (BF16)...
-Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  20%|█▉        | 387/1951 [00:00<00:00, 3844.05it/s]Loading weights:  40%|███▉      | 772/1951 [00:01<00:02, 493.04it/s] Loading weights:  49%|████▊     | 949/1951 [00:01<00:01, 566.70it/s]Loading weights:  56%|█████▌    | 1088/1951 [00:01<00:01, 572.45it/s]Loading weights:  61%|██████▏   | 1195/1951 [00:02<00:01, 555.91it/s]Loading weights:  66%|██████▌   | 1282/1951 [00:02<00:01, 535.72it/s]Loading weights:  87%|████████▋ | 1701/1951 [00:02<00:00, 1068.36it/s]Loading weights: 100%|██████████| 1951/1951 [00:02<00:00, 830.87it/s] 
-  [e2e-fwd] N=   512: sdpa=45.50ms triton=43.60ms  1.04x
-  [e2e-fwd] N=  1024: sdpa=44.02ms triton=44.46ms  0.99x
-  [e2e-fwd] N=  2048: sdpa=64.12ms triton=48.18ms  1.33x
-  [e2e-fwd] N=  4096: sdpa=160.81ms triton=82.09ms  1.96x
-  [e2e-fwd] N=  8192: sdpa=484.08ms triton=167.40ms  2.89x
-  [e2e-fwd] N= 16384: sdpa=1642.81ms triton=364.18ms  4.51x
+Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  20%|█▉        | 387/1951 [00:00<00:00, 3845.29it/s]Loading weights:  40%|███▉      | 772/1951 [00:01<00:02, 487.59it/s] Loading weights:  49%|████▊     | 949/1951 [00:01<00:01, 560.29it/s]Loading weights:  56%|█████▌    | 1087/1951 [00:01<00:01, 567.86it/s]Loading weights:  61%|██████    | 1194/1951 [00:02<00:01, 553.29it/s]Loading weights:  66%|██████▌   | 1281/1951 [00:02<00:01, 532.04it/s]Loading weights:  87%|████████▋ | 1707/1951 [00:02<00:00, 1071.96it/s]Loading weights: 100%|██████████| 1951/1951 [00:02<00:00, 826.30it/s] 
+  [e2e-fwd] N=   512: sdpa=42.70ms triton=43.09ms  0.99x
+  [e2e-fwd] N=  1024: sdpa=43.68ms triton=43.45ms  1.01x
+  [e2e-fwd] N=  2048: sdpa=64.09ms triton=48.27ms  1.33x
+  [e2e-fwd] N=  4096: sdpa=159.85ms triton=81.80ms  1.95x
+  [e2e-fwd] N=  8192: sdpa=483.71ms triton=168.86ms  2.86x
+  [e2e-fwd] N= 16384: sdpa=1639.18ms triton=366.50ms  4.47x
   [e2e-fwd] N=32768: OOM (likely SDPA)
-             Triton still runs: 886.85ms
+             Triton still runs: 902.65ms
 
 === 4. Gemma-4-E2B peak memory ===
 [load] Gemma-4-E2B for memory benchmark...
-Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  20%|█▉        | 385/1951 [00:00<00:00, 3825.56it/s]Loading weights:  39%|███▉      | 768/1951 [00:01<00:02, 488.81it/s] Loading weights:  48%|████▊     | 944/1951 [00:01<00:01, 569.02it/s]Loading weights:  56%|█████▌    | 1085/1951 [00:01<00:01, 571.48it/s]Loading weights:  61%|██████    | 1193/1951 [00:01<00:01, 558.23it/s]Loading weights:  66%|██████▌   | 1281/1951 [00:02<00:01, 532.50it/s]Loading weights:  88%|████████▊ | 1709/1951 [00:02<00:00, 1074.64it/s]Loading weights: 100%|██████████| 1951/1951 [00:02<00:00, 830.33it/s] 
+Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  20%|█▉        | 386/1951 [00:00<00:00, 3843.23it/s]Loading weights:  40%|███▉      | 771/1951 [00:01<00:02, 493.98it/s] Loading weights:  49%|████▊     | 948/1951 [00:01<00:01, 570.01it/s]Loading weights:  56%|█████▌    | 1088/1951 [00:01<00:01, 575.05it/s]Loading weights:  61%|██████▏   | 1196/1951 [00:02<00:01, 553.68it/s]Loading weights:  66%|██████▌   | 1283/1951 [00:02<00:01, 534.59it/s]Loading weights:  88%|████████▊ | 1711/1951 [00:02<00:00, 1077.96it/s]Loading weights: 100%|██████████| 1951/1951 [00:02<00:00, 832.32it/s] 
   [memory] N=   512: sdpa=522.505859375 MB, triton=522.505859375 MB
   [memory] N=  1024: sdpa=1045.005859375 MB, triton=1045.005859375 MB
-  [memory] N=  2048: sdpa=2090.005859375 MB, triton=2090.005859375 MB
+  [memory] N=  2048: sdpa=2090.005859375 MB, triton=2091.005859375 MB
   [memory] N=  4096: sdpa=4180.005859375 MB, triton=4180.005859375 MB
   [memory] N=  8192: sdpa=8360.005859375 MB, triton=8360.005859375 MB
   [memory] N= 16384: sdpa=22016.44384765625 MB, triton=16720.005859375 MB

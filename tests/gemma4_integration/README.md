@@ -88,17 +88,18 @@ PACKAGE_DISTRIBUTION_MAPPING.setdefault('flash_attn', ['flash-attn'])
 
 | seq_len | SDPA (ms) | Triton (ms) | Speedup |
 |---------|-----------|-------------|---------|
-| 512     | 49.04     | 49.74       | 0.99x   |
-| 1024    | 46.48     | 46.61       | 1.00x   |
-| 2048    | 63.51     | 48.00       | 1.32x   |
-| 4096    | 158.38    | 81.03       | **1.95x** |
-| 8192    | 480.99    | 167.31      | **2.87x** |
-| 16384   | 1638.54   | 363.37      | **4.51x** |
+| 512     | 42.70     | 43.09       | 0.99x   |
+| 1024    | 43.68     | 43.45       | 1.01x   |
+| 2048    | 64.09     | 48.27       | 1.33x   |
+| 4096    | 159.85    | 81.80       | **1.95x** |
+| 8192    | 483.71    | 168.86      | **2.86x** |
+| 16384   | 1639.18   | 366.50      | **4.47x** |
+| 32768   | **OOM**   | 902.65      | (SDPA OOMs) |
 
 Correctness (vs SDPA, N=1024):
-- Max logits abs diff: 3.23e+00 (on logits of magnitude ~1e2 × vocab_size=262144)
-- Rel Frobenius diff:  2.27e-02
-- Cosine similarity:   **0.999745**
+- Max logits abs diff: 2.36e+00 (on logits of magnitude ~1e2 × vocab_size=262144)
+- Rel Frobenius diff:  2.28e-02
+- Cosine similarity:   **0.999758**
 - Top-1 token match (last pos): **100%**
 - Top-5 overlap (last pos): **5/5**
 

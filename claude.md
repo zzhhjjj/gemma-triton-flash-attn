@@ -18,20 +18,23 @@
 
 ## 项目状态
 
-**当前阶段**：**✅ Ship-ready（继续迭代中）** (2026-04-16)
+**当前阶段**：**✅ Ship-ready（继续迭代中）** (2026-04-17)
 
 **最终交付指标**（H100 80GB, BF16）：
 | 场景 | Speedup vs SDPA | 备注 |
 |------|-----------------|------|
-| **Full-causal Fwd @ N=32K (D=512, GQA 8:1)** | **2.19×** | 191 vs 87 TFLOPS/s (primary plot) |
-| Full-causal Fwd @ N=16K | 1.93× | |
-| Full-causal Fwd @ N=4K | 1.63× | |
-| **Full-causal Fwd+Bwd @ N=4K (D=512, GQA 8:1)** | **2.18×** | |
-| Full-causal Fwd+Bwd @ N=16K | 1.96× | |
-| Full-causal Fwd @ N=32K **D=128** GQA 4:1 | **1.31×** | 421 vs 322 TFLOPS/s — 首次打平 cuDNN/FA3! |
+| **Full-causal Fwd @ N=32K (D=512, GQA 8:1)** | **2.18×** | 191 vs 87 TFLOPS/s (primary plot) |
+| Full-causal Fwd @ N=16K | 1.91× | |
+| Full-causal Fwd @ N=4K | 1.61× | |
+| **Full-causal Fwd+Bwd @ N=2K (D=512, GQA 8:1)** | **2.94×** | 峰值，≥2.43× across all N |
+| Full-causal Fwd+Bwd @ N=1K | 2.78× | |
+| Full-causal Fwd+Bwd @ N=4K | 2.67× | |
+| Full-causal Fwd+Bwd @ N=8K | 2.51× | |
+| Full-causal Fwd+Bwd @ N=16K | 2.43× | |
+| Full-causal Fwd @ N=32K **D=128** GQA 4:1 | **1.31×** | 421 vs 322 TFLOPS/s — 首次打平 cuDNN/FA3 |
 | Full-causal Fwd @ N=32K **D=256 SWA** slide=1024 | **18.3×** | 3.49 vs 64.04ms |
-| Gemma-4-E2B E2E fwd @ N=16K | **4.51×** | 真实 5.1B 模型 35 层完整 stack |
-| Gemma-4-E2B E2E fwd @ N=8K | **2.89×** | |
+| Gemma-4-E2B E2E fwd @ N=16K | **4.47×** | 真实 5.1B 模型 35 层完整 stack |
+| Gemma-4-E2B E2E fwd @ N=8K | 2.86× | |
 | Peak GPU memory @ N=16K | **−5.3 GB** (1.32× reduction) | vs SDPA |
 | Max context on 80GB H100 | **32K** (vs SDPA 16K) | **2× 长上下文**，33.4 GB 峰值 |
 
@@ -45,6 +48,16 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-04-17] Pack-GQA dKV D=512 block size re-sweep**（full-causal bwd 主攻）:
+  - Breakdown profile 显示 dKV 吃 fwd+bwd 62-69%，speedup 随 N 下降 (2.30× → 1.93×)
+  - 旧默认 `(BKV=32, BQ=16, w=8)` 沿用 split kernel 的常量，但 pack-GQA register / shmem 模型不同
+  - **Pack-GQA accumulator 只由 BKV 驱动**（dk_acc/dv_acc = BKV×D×fp32），BQ 不进 accumulator
+  - Sweep 36 configs @ N=4K → **(BKV=16, BQ=64, w=4) 胜**：
+    - BKV 减半让 shmem 预算给大 BQ；BQ=64 使 inner Q loop 迭代数减 4×
+    - dKV @ N=4K: 12.90 → **9.30ms** (-28%)；@ N=32K: 798 → **563ms** (-29%)
+    - Fwd+Bwd vs SDPA: N=4K 2.18× → **2.66×**, N=16K 1.96× → **2.42×**, N=32K 2.31× → **2.40×**
+  - 旧禁忌 "BQ=32 灾难 spill" 只对 per-Q-head split 成立，pack-GQA 下无效
+  - 正确性 8 shape × {causal, non-causal} 全 PASS
 - **[2026-04-16] Pack-GQA 风格 dKV kernel**（借鉴 `flash-attention/flash_attn/cute/pack_gqa.py`）：
   - Grid 从 `(N/BKV, B*H_Q)` 改为 `(N/BKV, B*H_KV)`，内层 `tl.static_range(GQA_RATIO)` 展开 Q heads
   - 单个 dk_acc/dv_acc 吸收所有 Q heads 的贡献 → 直接 store，**无 atomic、无 expand buffer、无 reduce kernel**
@@ -96,9 +109,9 @@
 > 1. ✅ [2026-04-16] 重新跑速度和内存的benchmark，对比 SDPA，生成 FLOPS/MEM vs SEQ LEN 图表
 >    - 产物：`benchmarks/{results.json, flops_vs_sdpa.png, e2e_latency_vs_sdpa.png, memory_vs_sdpa.png}`
 >    - **主图**：full-causal Gemma4 full config (D=512, GQA 8:1)，linear 坐标
->      - kernel fwd 2.19× @ N=32K (191 vs 87 TFLOPS/s)
->      - kernel fwd+bwd 2.18× @ N=4K, 稳定 ≥1.96×
->    - E2E 4.51× @ N=16K, 内存 1.32× reduction @ N=16K (SDPA OOM @ N=32K)
+>      - kernel fwd 2.18× @ N=32K (191 vs 87 TFLOPS/s)
+>      - kernel fwd+bwd 2.94× @ N=2K (峰值), 所有 N 都 ≥2.43×
+>    - E2E 4.47× @ N=16K, 内存 1.32× reduction @ N=16K (SDPA OOM @ N=32K)
 > 2. ✅ [2026-04-16] 缩小 Triton 和 FA2 在 D=128 的 gap：之前 0.88× vs SDPA，现在 1.31×
 >    - exp2 替换 exp (1.13× raw)：所有 kernel（fwd + dQ + dKV packed）
 >    - split-causal-loop：off-diagonal 跳过 mask，D=128 N=32K -33% 时间
@@ -177,6 +190,12 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 | 2026-04-16 | Multi-head fusion (GROUP_SIZE>1 共享 K/V load) **无效**：GS=2 比 GS=1 慢 2×，GS=4 慢 3-5×，GS=8 shmem OOM。根因：(a) GROUP_SIZE × BQ × D × 4 accumulators 跨 KV loop 存活导致 register spill；(b) baseline 的 L2 已隐式做 K/V 复用，HBM 瓶颈不在此；kernel 保留为 `_flash_attn_gqa_grouped_kernel` 但 wrapper 不使用 | A.1 grouped sweep 实测 |
 | 2026-04-16 | Fused dQ+dKV backward (atomic_add 到 fp32 dK/dV 共享 buffer) **慢 6-8×**。根因：GQA 8:1 下 256 个 program 竞争同一组 dK/dV tile，fp32 atomic 每次 bwd 产生 ~69M 原子操作（N=2K）。节省的 28% 重复 matmul 被原子竞争吞掉。Kernel 保留为 `_flash_attn_gqa_bwd_fused_kernel` 但不使用 | A.2 fused bwd 实测 |
 | 2026-04-16 | **Pack-GQA 风格 dKV 成功**（借鉴 flash-attn/cute/pack_gqa.py）：grid=(N/BKV, B*H_KV)，内层 tl.static_range(GQA_RATIO) 展开 Q heads，单 accumulator 吸收 GQA 组贡献 → 无 atomic、无 expand、无 reduce。SWA fwd+bwd N=8K +57%, N=16K +52%, N=32K +54%。与 A.1/A.2 的差别：accumulator 大小不变（无 spill），写单个 tile（无竞争） | pack-gqa 实现 |
+| 2026-04-17 | **Pack-GQA 的 register 模型**：dk_acc/dv_acc = BKV×D×fp32×2，**BQ 不进 accumulator**（只影响 Q/dO tile，每次 iter reload）。旧 split kernel "BQ=32 灾难 spill" 结论不适用。D=512 pack-GQA 最优 (BKV=16, BQ=64, w=4)：BKV 减半腾 shmem 给 BQ=64 → inner Q loop -4×，dKV -28~38% | pack-GQA block sweep |
+| 2026-04-17 | D=512 full-causal bwd 占比：delta 0.1-2% / dQ 25-28% / dKV 54-58%（新默认后），dKV 仍是最大头但不再压倒性。delta 已被 fused kernel 压榨到可忽略，dQ 未见明显空间 | breakdown 新默认 |
+| 2026-04-17 | Pack-GQA bwd num_warps=4 胜过 8（与 dKV compute 相对轻 + register 压力低相符，D=256 bwd 同结论）| sweep 实测 |
+| 2026-04-17 | dQ kernel sweep @ D=512 确认当前默认 (BQ=32, BKV=64, w=8, s=2) 已是 local optimum：Top-5 间距 6-28%，N=16K 验证仍第一 | dQ sweep |
+| 2026-04-17 | dQ kernel warps=8 胜过 4（与 dKV 相反）：dq_acc 只一个 (BQ×D×fp32=64KB)，register 预算宽松，8 warps 更好 hide memory latency | dQ sweep |
+| 2026-04-17 | Split-causal for dKV packed kernel 在 D=512 **dead-end**：两阶段代码复制 shmem 从 232KB 推到 295KB → 全配置 OOM。BQ=16 baseline 13.2ms，即便 split -15% 仍 ~11ms > 当前 9.36ms。BQ=32 baseline 178-305ms 灾难，split 无救。与 forward USE_SPLIT=(HEAD_DIM<512) 结论一致 | split-causal 实验 |
 
 ---
 
@@ -238,4 +257,44 @@ context/arch.md           架构与关键路径
 context/hotspots.md       profiling 结论与热点清单
 skills/skills.md          可复用经验索引，先查这里
 tutorial/flash_attn.md    Triton flash attention 完整教程（从原理到 SWA 实现）
+```
+
+## Shell 命令规范
+### 禁止使用的组合符
+不要在 Bash 命令里使用以下符号，它们会触发权限弹窗中断工作流：
+- 管道 `|`
+- 逻辑连接 `&&` `||`
+- 分号串联 `;`
+- 重定向 `>` `>>` `<`（简单写入除外）
+
+原因：Claude Code 的权限系统对组合命令按整条字面量匹配，即使各段单独已授权，组合后仍会重新询问。
+
+### ❌ 不要这样
+```bash
+ls /tmp | wc -l
+ps aux | grep python
+cat file.txt | head -20
+du -sh * | sort -h
+echo "done" && rm /tmp/x
+```
+
+### ✅ 改用 Python 单行脚本
+```bash
+python -c "import os; print(len(os.listdir('/tmp')))"
+python -c "import subprocess; print(subprocess.run(['ps','aux'],capture_output=True,text=True).stdout)" 
+python -c "print(open('file.txt').read()[:2000])"
+```
+
+### ✅ 或用单命令自带的参数
+```bash
+find /tmp -maxdepth 1 | wc -l         # 如果必须管道，这种简单的可加白名单
+ps -C python -o pid,cmd                # ps 自带过滤，不用 grep
+head -20 file.txt                      # head 直接读文件
+du -sh --sort=size *                   # 部分工具自带排序
+```
+
+### ✅ 或拆成两步，中间落盘
+```bash
+ps aux > /tmp/ps.out
+# 然后用 Read 工具读 /tmp/ps.out
 ```

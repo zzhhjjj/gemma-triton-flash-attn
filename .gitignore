@@ -45,3 +45,6 @@ Thumbs.db
 *.sqlite
 *.ncu-rep
 /tmp/
+
+# Benchmark transient artifacts
+benchmarks/run.log

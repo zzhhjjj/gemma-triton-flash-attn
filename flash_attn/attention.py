@@ -1294,7 +1294,11 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # The old split path (_flash_attn_gqa_bwd_dkv_kernel with expand+reduce)
         # is kept in the source for reference but no longer on the hot path.
         if D >= 512:
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 16, 8
+            # Pack-GQA sweep @ N=4K Gemma4 (H_Q=32,H_KV=4): (BKV=16,BQ=64,w=4)
+            # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
+            # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
+            # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
         else:
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
         BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))

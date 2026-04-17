@@ -1,0 +1,211 @@
+{
+  "config": {
+    "B": 1,
+    "H_Q": 32,
+    "H_KV": 4,
+    "D": 512,
+    "dtype": "torch.float16",
+    "causal": true,
+    "N_sweep": 4096,
+    "N_verify": 16384
+  },
+  "sweep_N4K": [
+    {
+      "BQ": 32,
+      "BKV": 64,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 4.792543888092041
+    },
+    {
+      "BQ": 32,
+      "BKV": 64,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 5.106847763061523
+    },
+    {
+      "BQ": 32,
+      "BKV": 32,
+      "warps": 4,
+      "stages": 3,
+      "time_ms": 5.394207954406738
+    },
+    {
+      "BQ": 32,
+      "BKV": 32,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 5.694143772125244
+    },
+    {
+      "BQ": 16,
+      "BKV": 32,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 6.092959880828857
+    },
+    {
+      "BQ": 16,
+      "BKV": 32,
+      "warps": 4,
+      "stages": 3,
+      "time_ms": 6.516511917114258
+    },
+    {
+      "BQ": 16,
+      "BKV": 64,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 6.799647808074951
+    },
+    {
+      "BQ": 16,
+      "BKV": 64,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 7.002367973327637
+    },
+    {
+      "BQ": 32,
+      "BKV": 32,
+      "warps": 8,
+      "stages": 3,
+      "time_ms": 7.650176048278809
+    },
+    {
+      "BQ": 32,
+      "BKV": 16,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 7.700736045837402
+    },
+    {
+      "BQ": 32,
+      "BKV": 32,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 8.051712036132812
+    },
+    {
+      "BQ": 32,
+      "BKV": 16,
+      "warps": 4,
+      "stages": 3,
+      "time_ms": 8.338912010192871
+    },
+    {
+      "BQ": 16,
+      "BKV": 16,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 8.843744277954102
+    },
+    {
+      "BQ": 16,
+      "BKV": 32,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 8.866687774658203
+    },
+    {
+      "BQ": 16,
+      "BKV": 16,
+      "warps": 4,
+      "stages": 3,
+      "time_ms": 9.459487915039062
+    },
+    {
+      "BQ": 16,
+      "BKV": 32,
+      "warps": 8,
+      "stages": 3,
+      "time_ms": 9.664223670959473
+    },
+    {
+      "BQ": 64,
+      "BKV": 16,
+      "warps": 8,
+      "stages": 3,
+      "time_ms": 11.118464469909668
+    },
+    {
+      "BQ": 64,
+      "BKV": 16,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 11.41318416595459
+    },
+    {
+      "BQ": 64,
+      "BKV": 16,
+      "warps": 4,
+      "stages": 3,
+      "time_ms": 13.37996768951416
+    },
+    {
+      "BQ": 64,
+      "BKV": 16,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 13.740511894226074
+    },
+    {
+      "BQ": 32,
+      "BKV": 16,
+      "warps": 8,
+      "stages": 3,
+      "time_ms": 14.157952308654785
+    },
+    {
+      "BQ": 32,
+      "BKV": 16,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 14.861503601074219
+    },
+    {
+      "BQ": 16,
+      "BKV": 16,
+      "warps": 8,
+      "stages": 3,
+      "time_ms": 15.927743911743164
+    },
+    {
+      "BQ": 16,
+      "BKV": 16,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 16.18182373046875
+    }
+  ],
+  "verify_N16K": [
+    {
+      "BQ": 32,
+      "BKV": 64,
+      "warps": 8,
+      "stages": 2,
+      "time_ms": 4.792543888092041,
+      "time_N16K": 72.91462707519531,
+      "err_N16K": null
+    },
+    {
+      "BQ": 32,
+      "BKV": 64,
+      "warps": 4,
+      "stages": 2,
+      "time_ms": 5.106847763061523,
+      "time_N16K": 84.7547836303711,
+      "err_N16K": null
+    },
+    {
+      "BQ": 32,
+      "BKV": 32,
+      "warps": 4,
+      "stages": 3,
+      "time_ms": 5.394207954406738,
+      "time_N16K": 80.24774169921875,
+      "err_N16K": null
+    }
+  ]
+}

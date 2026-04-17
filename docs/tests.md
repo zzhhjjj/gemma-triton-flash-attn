@@ -31,7 +31,7 @@ Loads `google/gemma-4-E2B` (5.1B params, 35 layers: 7 full + 28 sliding),
 swaps attention to Triton via registry, compares logits vs SDPA.
 
 **Correctness at N=1024:**
-- cos similarity: **0.999745**
+- cos similarity: **0.999758**
 - top-1 token match (last position): **100 %**
 - top-5 token overlap (last position): **5 / 5**
 
