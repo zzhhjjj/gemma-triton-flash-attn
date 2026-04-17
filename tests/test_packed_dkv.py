@@ -147,6 +147,7 @@ def run_dkv_packed(q, k, v, do, lse, delta, *, causal, slide_size,
         BLOCK_Q=BQ, BLOCK_KV=BKV,
         GQA_RATIO=GQA_RATIO,
         IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+        Q_SPLITS=1,
         num_warps=num_warps, num_stages=2,
     )
     return dk, dv

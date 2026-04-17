@@ -685,12 +685,13 @@ def _delta_kernel(
 
 @triton.jit
 def _flash_attn_gqa_bwd_dq_kernel(
-    Q_ptr, K_ptr, V_ptr, dO_ptr, dQ_ptr,
+    Q_ptr, K_ptr, V_ptr, dO_ptr, O_ptr, dQ_ptr,
     LSE_ptr, Delta_ptr,
     stride_qb, stride_qh, stride_qn, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
     stride_dob, stride_doh, stride_don, stride_dod,
+    stride_ob, stride_oh, stride_on, stride_od,
     stride_dqb, stride_dqh, stride_dqn, stride_dqd,
     stride_lseb, stride_lseh, stride_lsen,
     stride_db, stride_dh, stride_dn,
@@ -701,6 +702,7 @@ def _flash_attn_gqa_bwd_dq_kernel(
     BLOCK_KV: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SLIDE_SIZE: tl.constexpr,  # 0 = no sliding window
+    STORE_DELTA: tl.constexpr,  # True: fuse delta = rowsum(dO * O) into dQ prologue
 ):
     q_block_idx = tl.program_id(0)
     bh_idx = tl.program_id(1)
@@ -728,7 +730,18 @@ def _flash_attn_gqa_bwd_dq_kernel(
     lse_ptrs = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh + q_offsets * stride_lsen
     lse = tl.load(lse_ptrs, mask=q_mask, other=0.0)
     delta_ptrs = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh + q_offsets * stride_dn
-    delta = tl.load(delta_ptrs, mask=q_mask, other=0.0)
+    if STORE_DELTA:
+        # Fused delta: compute delta = rowsum(dO * O) in prologue, store for dKV kernel.
+        # dO is already loaded; O adds ~BQ×D bytes per program (new load), but we save
+        # an entire _delta_kernel launch which is otherwise launch-bound at short N
+        # (32K programs of 512-byte work). Same do bandwidth, same o bandwidth, -1 launch.
+        o_base = O_ptr + b_idx * stride_ob + q_h_idx * stride_oh
+        o_ptrs = o_base + q_offsets[:, None] * stride_on + d_range[None, :] * stride_od
+        o_block = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0)
+        delta = tl.sum(do_block.to(tl.float32) * o_block.to(tl.float32), axis=1)
+        tl.store(delta_ptrs, delta, mask=q_mask)
+    else:
+        delta = tl.load(delta_ptrs, mask=q_mask, other=0.0)
 
     # Determine KV iteration range (mirrors forward kernel logic)
     if IS_CAUSAL:
@@ -1083,16 +1096,19 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     GQA_RATIO: tl.constexpr,  # N_Q_HEADS // N_KV_HEADS
     IS_CAUSAL: tl.constexpr,
     SLIDE_SIZE: tl.constexpr,
+    Q_SPLITS: tl.constexpr,  # 1 = direct store; >1 = atomic_add (caller pre-zeros dK/dV)
 ):
-    # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS)
+    # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS)
     kv_block_idx = tl.program_id(0)
     bkvh_idx = tl.program_id(1)
+    split_idx = tl.program_id(2)
     kv_h_idx = bkvh_idx % N_KV_HEADS
     b_idx = bkvh_idx // N_KV_HEADS
 
     k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
     v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
-    # dK/dV indexed by KV head — one program owns this tile entirely
+    # dK/dV indexed by KV head — one program owns this tile entirely (Q_SPLITS=1)
+    # or is one of Q_SPLITS programs sharing the tile via atomic_add
     dk_base = dK_ptr + b_idx * stride_dkb + kv_h_idx * stride_dkh
     dv_base = dV_ptr + b_idx * stride_dvb + kv_h_idx * stride_dvh
 
@@ -1127,6 +1143,18 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     else:
         q_loop_end = SEQ_LEN
 
+    # Q-split: each of Q_SPLITS programs handles a disjoint slice of Q blocks.
+    # Activated when raw grid << 132 SMs (e.g. H_KV=1 short N). Atomic_add on
+    # dK/dV (caller pre-zeroed) replaces direct store.
+    if Q_SPLITS > 1:
+        total_q_blocks = (q_loop_end - q_start + BLOCK_Q - 1) // BLOCK_Q
+        blocks_per_split = (total_q_blocks + Q_SPLITS - 1) // Q_SPLITS
+        q_lo = q_start + split_idx * blocks_per_split * BLOCK_Q
+        q_hi = tl.minimum(q_loop_end, q_start + (split_idx + 1) * blocks_per_split * BLOCK_Q)
+    else:
+        q_lo = q_start
+        q_hi = q_loop_end
+
     # Outer loop: Q heads (unrolled). Each Q head's contribution accumulates
     # into the SAME dk_acc/dv_acc — this replaces the expand+reduce pattern.
     for qh_offset in tl.static_range(GQA_RATIO):
@@ -1136,8 +1164,8 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
         lse_base = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh
         delta_base = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh
 
-        # Inner loop: Q blocks for this Q head
-        for q_start_pos in range(q_start, q_loop_end, BLOCK_Q):
+        # Inner loop: Q blocks for this Q head (sliced by split_idx)
+        for q_start_pos in range(q_lo, q_hi, BLOCK_Q):
             q_offsets = q_start_pos + tl.arange(0, BLOCK_Q)
             q_mask_local = q_offsets < SEQ_LEN
 
@@ -1173,12 +1201,16 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
 
     dk_acc *= scale
 
-    # Direct store — no atomic (only this program writes this tile),
-    # no reduce (all Q heads already summed into acc).
     dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
     dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
-    tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
-    tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+    if Q_SPLITS > 1:
+        # Caller pre-zeroed dK/dV; multiple programs contribute via atomic_add.
+        tl.atomic_add(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+    else:
+        # Direct store — only this program writes this tile.
+        tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
+        tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
 
 
 # =====================================================================
@@ -1449,18 +1481,11 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         _, H_KV, _, _ = k.shape
         scale = 1.0 / math.sqrt(D)
 
-        # Precompute delta = rowsum(dO * O) — fused Triton kernel is ~3x faster
-        # than `(do.float() * o.float()).sum(-1)` at short N (avoids allocating
-        # a full fp32 copy of both tensors).
+        # delta = rowsum(dO * O) fused into dQ kernel prologue (STORE_DELTA=True).
+        # Same bandwidth (dO already loaded by dQ; O is the only new read) but saves
+        # an entire _delta_kernel launch. At short N, the standalone delta kernel was
+        # launch-bound (grid = N × B × H_Q tiny programs of 512-byte work).
         delta = torch.empty(B, H_Q, N, dtype=torch.float32, device=q.device)
-        _delta_kernel[(N, B * H_Q)](
-            do, o, delta,
-            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            delta.stride(0), delta.stride(1), delta.stride(2),
-            N_HEADS=H_Q, SEQ_LEN=N, HEAD_DIM=D,
-            num_warps=4, num_stages=2,
-        )
 
         dq = torch.empty_like(q)
         GQA_RATIO = H_Q // H_KV
@@ -1479,11 +1504,12 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         grid_dq = (triton.cdiv(N, BLOCK_Q_BW), B * H_Q)
 
         _flash_attn_gqa_bwd_dq_kernel[grid_dq](
-            q, k, v, do, dq, lse, delta,
+            q, k, v, do, o, dq, lse, delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
             lse.stride(0), lse.stride(1), lse.stride(2),
             delta.stride(0), delta.stride(1), delta.stride(2),
@@ -1492,6 +1518,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             BLOCK_Q=BLOCK_Q_BW, BLOCK_KV=BLOCK_KV_BW,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
+            STORE_DELTA=True,
             num_warps=num_warps_bw, num_stages=2,
         )
 
@@ -1513,24 +1540,64 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
             num_stages_dkv = 2
-        elif N >= 8192:
-            # D<512 long N (Gemma-4-E2B sliding N≥8K): sweep (2026-04-17) found
-            # (BKV=64,BQ=128,w=8,s=1) beats (32,64,4,2) by 6% @ N=16K/32K
-            # slide=1024. Big tiles need s=1 to avoid shmem pressure.
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 64, 128, 8
-            num_stages_dkv = 1
         else:
-            # D<512 short N (N<8K): bigger tiles starve SM occupancy on H100
-            # (N=2K × BKV=64 = 32 programs = 24% of 132 SMs → +10% regression).
-            # Stick with the 2026-04-16 config that was tuned at short N.
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
-            num_stages_dkv = 2
+            # D<512: (BKV=64, BQ=128, w=8, s=1) is the big-tile config that
+            # wins when grid is healthy. We use it in TWO regimes:
+            #   (a) grid_at_bkv64 >= 128: plain one-wave+ (Config A any N,
+            #       Config B long N) — QS=1 below.
+            #   (b) grid_at_bkv64 <= 16: extreme starve (Config B short N,
+            #       H_KV=1, N≤1K) — rely on QS=8 to hit ~128 programs; big
+            #       tile amortizes atomic cost. Sweep (2026-04-17,
+            #       `dkv_config_b_bkv64.py`) @ Config B N=1K:
+            #         (BKV=32,BQ=64,w=4,s=2,QS=8) = 0.153 ms
+            #         (BKV=64,BQ=128,w=8,s=1,QS=8) = 0.144 ms (-6%)
+            # Middle regime (grid_at_bkv64 in 32-64, Config B N=2K/4K): BKV=32
+            # with tighter QS to hit ~256 programs wins slightly.
+            grid_at_bkv64 = triton.cdiv(N, 64) * B * H_KV
+            if grid_at_bkv64 >= 128 or grid_at_bkv64 <= 16:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 64, 128, 8
+                num_stages_dkv = 1
+            else:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
+                num_stages_dkv = 2
         BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))
         BLOCK_Q_DKV = min(BLOCK_Q_DKV, triton.next_power_of_2(N))
-        grid_dkv = (triton.cdiv(N, BLOCK_KV_DKV), B * H_KV)
 
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        # Q_SPLITS: split each KV block's Q loop across multiple programs via
+        # atomic_add, activated when the raw grid < target. Target differs by
+        # BLOCK_KV (tuned 2026-04-17 in `dkv_config_b_bkv64.py`):
+        #   BKV=64 (big tile): target ≈ 128 programs (one wave), each program
+        #     has enough work to amortize atomic cost without needing 2 waves.
+        #   BKV=32 (small tile): target ≈ 256 programs (two waves), since
+        #     per-program work is halved and needs more parallelism.
+        # Atomic cost (GQA_RATIO × QS programs per dK/dV tile contending) is
+        # offset by better SM occupancy in low-grid regime. For healthy grids
+        # QS>1 is net-negative by ~5-15%.
+        raw_grid_dkv = triton.cdiv(N, BLOCK_KV_DKV) * B * H_KV
+        target_grid = 128 if BLOCK_KV_DKV == 64 else 256
+        if raw_grid_dkv >= target_grid:
+            Q_SPLITS_DKV = 1
+        elif raw_grid_dkv * 2 >= target_grid:
+            Q_SPLITS_DKV = 2
+        elif raw_grid_dkv * 4 >= target_grid:
+            Q_SPLITS_DKV = 4
+        else:
+            Q_SPLITS_DKV = 8
+
+        grid_dkv = (triton.cdiv(N, BLOCK_KV_DKV), B * H_KV, Q_SPLITS_DKV)
+
+        # atomic_add path requires pre-zeroed buffers (multiple programs contribute).
+        # Alloc micro-optimization (2026-04-17, `benchmarks/alloc_overhead.py`):
+        # combine dk+dv into one 5D empty, zero once, then slice. Saves 1
+        # allocator call + 1 cudaMemsetAsync for the QS>1 path. Tiny (~5μs) but
+        # free since semantically identical.
+        if Q_SPLITS_DKV > 1:
+            dkv = torch.empty((2,) + k.shape, dtype=k.dtype, device=k.device)
+            dkv.zero_()
+            dk, dv = dkv[0], dkv[1]
+        else:
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
 
         _flash_attn_gqa_bwd_dkv_packed_kernel[grid_dkv](
             q, k, v, do, dk, dv, lse, delta,
@@ -1548,6 +1615,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
+            Q_SPLITS=Q_SPLITS_DKV,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 

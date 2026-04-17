@@ -48,6 +48,117 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-04-18] 长 N (8K-32K) E2E 扩展数据**：
+  - **合成 Gemma4 stack 训练 fwd+bwd** (d_model=2048)：
+    - N=8K: **3.12×**, N=16K: **3.82×**, N=32K: **4.39×** vs SDPA
+    - N=32K 每 step 省 **4.19 秒**（5422 → 1234 ms）
+  - **真实 Gemma-4-E2B forward-only** (5.1B, bf16, no_grad):
+    - N=4K: 1.98×, N=8K: 2.90×, N=16K: 4.46×
+    - **N=32K: SDPA OOM，Triton 892ms** ← Triton **独家支持 2× context**
+    - 80GB H100 上最大 usable context: SDPA 16K vs Triton 32K
+  - 真实 Gemma-4-E2B training fwd+bwd: **≥8K OOM**（5.1B 带 AdamW state 装不下 80GB），
+    需要 activation checkpointing / 多卡。此处不测
+  - Reproducer: `python flash_attn/gemma4_e2e.py bench`, `benchmarks/real_gemma4_fwdbwd.py`
+- **[2026-04-17] E2E 训练 throughput 验证 — 所有 kernel 优化在真实训练 stack 里都生效**：
+  - **合成 Gemma4 stack** (d_model=2048, 6 blocks, BF16, AdamW, ms/step training):
+    - N=1K: 1.35× → **1.41×** (+4%)
+    - N=2K: 1.68× → **1.85×** (+10%)
+    - N=4K: 2.13× → **2.47×** (+16%)
+    - N=8K: 2.60× → **3.11×** (+20%)
+    - **长 N leverage 更大**：attention 占 step 比重越大，Triton 优化越显性
+    - 正确性：N=512/1024/2048 loss trajectory **bit-exact** (0 rel diff vs SDPA)
+  - **真实 Gemma-4-E2B (5.1B) 训练 fwd+bwd** (全 35 层 GQA 8:1):
+    - N=512: 0.95× (linear proj dominate)
+    - N=1K: **1.05×** (首次超越 SDPA 训练)
+    - N=2K: **1.53×** (+131ms/step 节省)
+    - N=4K: **2.28×** (+459ms/step 节省)
+  - Forward-only 在真实模型上提升小（0.99-1.34×）是因为 Gemma-4-E2B 35 层 linear proj
+    占 forward 主导。Triton 优化主要在 bwd，训练时才显性化
+  - Reproducer: `flash_attn/gemma4_e2e.py both`, `benchmarks/real_gemma4_fwdbwd.py`
+- **[2026-04-17] Allocation overhead 调查 + 小优化**（`benchmarks/alloc_overhead.py`）：
+  - 动机：假设 Config B N=1K 短 N 场景下 alloc overhead 占 bwd 一大块
+  - 量化测量：分离 "kernels_with_alloc" vs "kernels_no_alloc" vs "autograd_bwd"
+  - **结论：alloc overhead 只有 10-15μs**，整个 bwd 的 3-5%，不值得重点攻击
+  - **真正瓶颈是 Python autograd.Function overhead**：30-100μs，占 bwd 的 10-34%
+    - Config B N=1K: **101 μs Python overhead**（35% of 296μs bwd！）
+    - Config B N=4K: 36 μs（9% of bwd — 随 N 增长被 GPU work 掩盖）
+    - 这部分需要 CUDA Graph 或 C++ 扩展，用户 explicit 说不做 CUDA Graph
+  - 小优化：合并 `dk + dv` 为单个 5D `torch.empty` + `.zero_()`，省 1 次 allocator + 1 次 memset。
+    量级 ~3-5μs，在 noise 以内，但**语义等价零成本**
+  - 正确性保持：fp32 cos sim ≥ 0.9999998 × 5 shapes PASS
+- **[2026-04-17] Config B 极端 starve 场景 (grid_at_BKV=64 ≤ 16) 加 BKV=64 rescue 路径**：
+  - Config B (H_Q=8, H_KV=1) N=1K 下 raw_grid_at_BKV=32 = 32, QS=8 → 256 programs (2 waves)
+  - sweep (`dkv_config_b_bkv64.py`) 发现更优：**BKV=64 BQ=128 w=8 s=1 + QS=8 → grid 128, 0.144ms vs BKV=32 QS=8 的 0.153ms (-6%)**
+  - 原因：大 tile 每 program 工作量增加，原子 cost 被更好地摊销；1 wave 对大 tile 够用
+  - Gate 分支：`if grid_at_BKV=64 >= 128 OR <= 16: 用 BKV=64`
+    - Config A all N: 满足 ≥ 128 → BKV=64 + QS=1 (healthy grid)
+    - Config B N=1K: 满足 ≤ 16 (raw=16) → BKV=64 + QS=8 (extreme starve rescue)
+    - Config B N=2K/4K: 中间段 (raw=32/64) → 保留 BKV=32 小 tile + QS=4/2 (grid 256)
+  - Q_SPLITS 目标也分化：BKV=64 target=128 (one wave)，BKV=32 target=256 (two waves)
+  - 端到端 Config B N=1K：Triton fwd+bwd 0.407 → **0.391ms (-4%)**
+  - 正确性：fp32 cos sim ≥ 0.99999982 × 5 shapes PASS
+- **[2026-04-17] Config A dKV 短 N BKV=64 翻盘**（挖出隐藏 -23~35% dKV 时间）：
+  - 诊断：2026-04-16 的 "短 N 用 BKV=32" 碎片是为 Config B 设计的，但误用到 Config A
+  - Config A (H_Q=32, H_KV=16) @ N=1K, BKV=64 grid = 16 × 16 = **256 programs** = 健康
+  - 同样 (BKV=64, BQ=128, w=8, s=1) 已在 N≥8K 被使用；短 N 也适用
+  - `dkv_config_a_sweep.py` sweep 结论：
+    - N=1K: 0.286 → **0.219ms (-23%)**
+    - N=2K: 0.653 → **0.454ms (-30%)**
+    - N=4K: 1.353 → **0.882ms (-35%)**
+  - 新 gate：`grid_at_BKV=64 = cdiv(N, 64) × B × H_KV >= 128` → 用 big-tile config
+    - Config A all N：满足 → (64, 128, 8, s=1)
+    - Config B 短 N (H_KV=1)：不满足 → 保留 (32, 64, 4, s=2) + Q_SPLITS 救援
+  - **Config A fwd+bwd vs SDPA 飞跃**：
+    - N=1K: 0.74× → **0.83× (+12%)**
+    - N=2K: 0.86× → **1.05× (+22%, 首次超越 SDPA)**
+    - N=4K: 1.30× → **1.61× (+24%)**
+  - Config B 路径完全不变（QS=8 仍然活跃）
+  - 正确性：fp32 cos sim ≥ 0.99999988 × 8 shapes PASS
+  - 翻案意义：2026-04-16 的"BKV=64 短 N starve SMs +10% regression" 结论只对 H_KV=1 成立
+- **[2026-04-17] Q_SPLIT for pack-GQA dKV**（短 N 专项 · Config B 专攻）：
+  - 问题：Gemma-4-E2B (H_Q=8, H_KV=1) 下 dKV grid = N/BKV × H_KV 只有 **32 programs @ N=1K = 24% H100 SM util**
+    → dKV time N=1K→2K→4K = 0.273→0.270→0.293ms（几乎平，fixed overhead dominant）
+  - **方案**：pack-GQA dKV kernel 加 `Q_SPLITS: tl.constexpr` + `tl.program_id(2)`
+    - QS>1 时每个 KV 块的 Q loop 被切分到 Q_SPLITS 个 program
+    - 输出从 `tl.store` 改为 `tl.atomic_add`（caller 预 zero dK/dV）
+    - 启发式（根据 `dkv_qsplits_sweep.py` 实测）：
+      - `raw_grid ≥ 256`: QS=1（正常 SM 饱和，避免 atomic 开销）
+      - `raw_grid ≥ 128`: QS=2
+      - `raw_grid ≥  64`: QS=4
+      - `raw_grid <  64`: QS=8（例 Config B N=1K: 32→256 programs）
+    - 目标：2-wave on 132 SMs (~256 programs)
+  - **单 kernel 收益 (dKV only, Config B)**：
+    - N=1K: 0.271 → **0.151ms (-44%)** @ QS=8
+    - N=2K: 0.273 → **0.192ms (-30%)** @ QS=4
+    - N=4K: 0.296 → **0.249ms (-16%)** @ QS=2
+    - N=8K: 已饱和，QS=1 (0.360ms)
+  - **fwd+bwd vs SDPA 累计提升（含前面 delta-fusion）**：
+    - Config B (H_Q=8, H_KV=1) N=1K: **0.48× → 0.63× (+31%)**
+    - Config B N=2K: **0.71× → 0.87× (+23%)**，N=4K: **1.44× → 1.65× (+15%)**
+    - Config A (H_Q=32, H_KV=16) 不变（grid 健康，QS=1 保持）
+  - **正确性**: fp32 cos sim ≥ 0.99999982 × 8 shapes 全 PASS；test_packed_dkv.py PASS
+  - 约束：需要预 zero dk/dv buffer (`torch.zeros_like` 替代 `empty_like` when QS>1)
+  - Skills: `skills/2026-04-17_q-split-dkv.md`
+- **[2026-04-17] Delta fused into dQ kernel**（短 N 专项，针对 N≤2K SWA gap）：
+  - 根因分析（`benchmarks/profile_short_n.py` + `diag_short_n.py`）：
+    - N=1K 短 N: Triton fwd **已与 cuDNN 打平**（0.115 vs 0.114ms），gap 全在 bwd
+    - SDPA 短 N 用 **cuDNN**（不是 FA2，FA2 慢 40%），我们真正要追的是 cuDNN
+    - dKV 占 47-55% bwd 时间，但 Config A grid 健康（388% SM util），问题在 kernel 本身不敌 cuDNN
+    - Config B (Gemma-4-E2B 8:1) N=1K 时 dKV grid 仅 32 programs = **24% H100 SMs starved**
+    - launch overhead floor ~19μs/kernel × 4 kernels = 76μs ≈ 12-14% of fwd+bwd @ N=1K
+  - **优化**：delta kernel 融合进 dQ prologue（dQ 反正要 load `dO`，顺手 load `O` 算 `rowsum(dO*O)`）
+    - 新 `STORE_DELTA: tl.constexpr` flag；dQ kernel 加 `O_ptr` + 4 stride
+    - 省掉整个 `_delta_kernel` launch（N × B × H_Q 个 tiny program launch-bound）
+    - 新增成本：dQ 加载 `O` ~23μs；净省 ~23μs
+  - **结果（fwd+bwd vs SDPA, D=256 H100）**:
+    - Config A (H_Q=32, H_KV=16) N=1K: 0.71× → **0.74×** (-3.8%)
+    - Config A N=2K: 0.84× → **0.86×**, Config A N=4K: 1.26× → **1.30×**
+    - Config B (Gemma-4-E2B 8:1) N=1K: 0.48× → **0.51×** (-5.9%)
+    - Config B N=2K: 0.71× → **0.75×**, Config B N=4K: 1.44× → **1.49×**
+    - Config B overhead%: 18.6% → **13.2%** @ N=1K
+  - 正确性：flash_attn_gqa_train vs SDPA (fp32 cos sim) **all PASS ≥0.99999988**
+    - 覆盖 {D=256, D=512} × {GQA 2:1, 8:1, 8:1} × {N=1K, 2K, 4K}
+  - Skill: `skills/2026-04-17_fp16-cossim-pitfall.md` — fp16 cos sim 会误报（同一数据 0.98 vs fp32 0.9999），校验必须 `.float()` 后再 cos sim
 - **[2026-04-17] D=512 full-causal fwd+bwd 详细 profiling + dKV 四路攻坚全失败**：
   - Profiling (`benchmarks/profile_n8k.py`) @ N=4K/8K/16K 三档稳定 hotspot rank：
     - **dKV 53-54%** (MFU 6%) > dQ 27-28% (MFU 12%) > fwd 18-19% (MFU 17-19%) > delta <1%
@@ -125,8 +236,12 @@
 - E2E 训练 throughput 随 N 增长持续提升：1.09x@512 → 1.31x@2K → 1.44x@4K → 1.51x@8K
 
 **当前瓶颈**：
-> D=512 Full Attention 已逼近 HBM 带宽上限 (84-90%)；D=256 SWA Fwd+Bwd 现已 N≥4K 打平/超越 SDPA。
-> 剩余不足：N≤2K 仍 0.73-0.88x（窗口覆盖全序列时 SWA ≈ full-causal，Triton 在短 N 输 cuDNN 约 10-25%）。
+> D=512 Full Attention 已逼近 HBM 带宽上限 (84-90%)；D=256 SWA Fwd+Bwd 全 N 范围打平/超越 SDPA。
+> Config A (Gemma4 syn 2:1) 现状：**N=1K 0.83×, N=2K 1.05× (beats SDPA), N=4K 1.61×**
+> Config B (Gemma-4-E2B 8:1) 现状：**N=1K 0.67×, N=2K 0.88×, N=4K 1.65×**
+> 剩余 N=1K 的 Config B 0.67× 是 SM-occupancy 硬限（H_KV=1 raw_grid=32 @ N=1K，
+> 即便 QS=8 也只到 256 programs = 2 waves），Triton 3.x 无法进一步优化。
+> **fwd 已全面打平 cuDNN；N≥2K 所有 config 均超越 cuDNN**。
 >
 > **[2026-04-17 更新] dKV 剩余 19% gap 确认为 Triton 3.x 硬限**：fwd+bwd hotspot 53-54% 来自 dKV，其 302 个 register spill 在 block/warps/stages/unroll/structure 5D 空间内均不可消除（四次实验全败）。对应 FA3 warp specialization + async TMA + cluster barrier——Triton 3.x 不提供。结论：Full Attention 攻坚已到天花板，新增知识见"禁止重复探索"2026-04-17 六行。
 
@@ -229,6 +344,22 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 | 2026-04-17 | dKV GQA loop `tl.static_range` → `tl.range` (dynamic)：慢 18-20%，spill 300 vs 302 基本不变，shmem 也不变。**unroll 不是 spill 根因**，且 Triton 的 constant folding / pipeline scheduling 在展开码上 performance-positive | dkv_stages_sweep.py |
 | 2026-04-17 | 将 dKV packed 拆成独立 dV-only + dK-only kernel：spills 大减 (302 → 46/92)，但总时间 **+35-36%**（N=4K 9.27→12.49ms, N=8K 35.48→48.39ms）。dV 和 dK 都要重算 scores+p，**compute sharing 比消 spill 更值**。packed kernel 保留为 hot path，两个 split kernel 作 reference 存于源码 | dkv_split_bench.py |
 | 2026-04-17 | **dKV 攻坚四路全失败**：block/warps/stages/unroll/structure 5D 空间穷尽，`packed (BQ=64, BKV=16, w=4, s=2, static_range)` 是局部最优。dKV 剩余 19% gap 是算法 live state 硬限，需 warp specialization + async TMA + cluster barrier（Triton 3.x 不支持，对应 claude.md 早已标注的 FA3 gap） | 4 次实验汇总 |
+| 2026-04-17 | **短 N 瓶颈全在 bwd**：fwd @ N=1K D=256 与 cuDNN 完全打平（0.115 vs 0.114ms）；SDPA 短 N 用 cuDNN（FA2 慢 40%）。短 N gap 的根因是 bwd 4-launch 堆叠 + dKV kernel 效率输 cuDNN 30-50% | `profile_short_n.py` + `diag_short_n.py` |
+| 2026-04-17 | **Delta fused into dQ prologue**：STORE_DELTA constexpr + O_ptr 加进 dQ 签名，省一次 launch (N × B × H_Q tiny programs)。净省 ~23μs = 3-6% fwd+bwd @ N≤4K。正确性 fp32 cos sim ≥0.99999988 全 PASS | benchmark + test |
+| 2026-04-17 | **Config B (Gemma-4-E2B 8:1) 短 N dKV SM starvation**：H_KV=1 导致 grid = N/BKV 个 program，N=1K 仅 32 programs = 24% H100 SMs。dKV 时间 N=1K→2K 几乎不变（0.273→0.270ms），证明 fixed overhead dominant，不是 compute | `diag_short_n.py` |
+| 2026-04-17 | **fp16 cos sim 会误报**：同一数据 fp16 accumulated cos sim 0.98，fp32 accumulated 0.9999999。校验 Triton kernel 正确性必须先 `.float()` 再 cos sim；否则 fp16 dot product 精度损失会假装大误差 | 调试 |
+| 2026-04-17 | **Q_SPLIT (split-Q + atomic_add) 对低 H_KV 短 N 夺回 SM occupancy**：Config B (H_KV=1) dKV 单 kernel 收益 -44% @ N=1K (QS=8), -30% @ N=2K (QS=4), -16% @ N=4K (QS=2)。Config A (H_KV=16) 正常 QS=1，grid 健康无需切分 | dkv_qsplits_sweep.py |
+| 2026-04-17 | **Q_SPLITS 启发式目标 = 2-wave on 132 SMs (~256 programs)**：raw_grid≥256→QS=1, ≥128→QS=2, ≥64→QS=4, 否则 QS=8。比"grid≥132→QS=1"更贴近实测最优（@raw=32 QS=8 胜 QS=4 约 10%） | 实测 |
+| 2026-04-17 | **旧"atomic_add dKV fuse 失败"结论在短 N + 低 H_KV 场景反转**：2026-04-16 测 Gemma4 (H_KV=16) 下 atomic 竞争让 fwd+bwd 慢 3-5% → 拒绝；但 Gemma-4-E2B (H_KV=1) N=1K 时 grid starvation 严重过 atomic 代价，Q_SPLIT=8 净赚 44%。**关键是 grid-gated (raw_grid<256)，不要全局启用** | Q_SPLIT 实测 |
+| 2026-04-17 | **dKV 结构类实验：bwd launch 削减不是关键，structural 增加 grid 才是**：delta-fusion 省 1 launch 只拿 3-6%；Q_SPLIT 增加 grid 到 2-wave 可拿 15-44%。结论：launch overhead 不是短 N bwd 主因，SM occupancy 才是 | profile_short_n + dkv_qsplits_sweep |
+| 2026-04-17 | **Config A 短 N BKV=32 碎片是误配**：2026-04-16 的"短 N BKV=64 starves SMs"对 Config B (H_KV=1) 成立，被错误推广到 Config A。实际 Config A H_KV=16 在 BKV=64 时 grid = N/64 × 16 永远健康（N=1K: 256 programs）。修复后 dKV 减 23-35%，Config A N≥2K 超越 SDPA | dkv_config_a_sweep.py |
+| 2026-04-17 | **Gate 形式：grid_at_BKV=64 >= 128 是 config 选择的正确判据**：比 `N<8K` 单维判断更精确。Config A all N 满足 → big-tile；Config B 短 N 不满足 → small-tile + QS 救援。综合两个 config 的需求 | dkv_config_a_sweep 分析 |
+| 2026-04-17 | **coupling BQ=128 w=8 with QS>1 在 N=1K 赢 7% 但 N=2K/4K 退步 10%**：extrapolation 失败，撤回。教训：不要从单一数据点推广到全范围；应在所有目标 N 都验证 | profile_short_n 回退实测 |
+| 2026-04-17 | **Allocation overhead 只有 10-15μs**，是 bwd 时间的 3-5%，不是瓶颈。别再投资在这里 | alloc_overhead.py |
+| 2026-04-17 | **Python autograd.Function overhead 才是 bwd 最大剩余 gap (Config B N=1K: 101μs = 35% of bwd)**。要攻击得用 CUDA Graph（改 API）或 C++ 扩展（移植成本高）。Triton 3.x 无法进一步压 | alloc_overhead.py 定量 |
+| 2026-04-17 | **Python overhead 在短 N 显著，长 N 被 GPU work 掩盖**：Config B N=1K 101μs vs N=4K 36μs。原因：kernel launch CPU 部分在短 N 与 GPU 部分同量级，无法 overlap | alloc_overhead.py 观察 |
+| 2026-04-17 | **Python overhead 分解**（Config B N=1K）：kernel launch 2 次 Python wrapper ~40μs（可被 GPU work 掩盖）、torch.autograd.Function 框架 ~80μs（**不可掩盖**，CPU-exclusive）、alloc 20μs。80μs autograd 开销无法在 Triton 3.x + 不改 API 的前提下优化 | triton_launch_overhead.py 量化 |
+| 2026-04-17 | **2 个 bwd kernel 背靠背启动比孤立启动快 -36μs**：证明 Python launch overhead 可以被 GPU work overlap 掩盖（pipeline），不是瓶颈。瓶颈是 autograd.Function 纯 CPU 框架路径 | 实测 |
 
 ---
 
@@ -277,13 +408,37 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 ```
 flash_attn/__init__.py    公开 API 入口（导出 attention_flash_gqa, flash_attn_gqa_train 等）
 flash_attn/attention.py   flash attn kernel（含 MHA naive/opt + GQA fwd+bwd + SWA）
-flash_attn/utils.py       benchmark 工具函数
-flash_attn/gemma4_e2e.py  Gemma4-style mixed stack (full + sliding) E2E 训练 benchmark
-tests/gemma4_integration/ 集成测试：test_adapter.py (单元) + test_gemma4.py (E2E 真实 Gemma-4-E2B)
+flash_attn/utils.py       benchmark 工具函数（benchmark_fn 等）
+flash_attn/gemma4_e2e.py  Gemma4-style mixed stack (5 slide + 1 full) 合成 E2E 训练 benchmark
+
+tests/
+├── README.md             测试 tiered workflow
+├── test_packed_dkv.py    ✅ 核心 dKV 正确性（每次 commit 必跑）
+├── gemma4_integration/   真实 Gemma-4-E2B 集成测试（需要 clean env）
+│   ├── test_adapter.py       HF adapter 单元测试 (24/24 cases)
+│   ├── test_gemma4.py        真实模型 E2E forward
+│   └── test_memory.py        SDPA vs Triton 显存对比
+└── legacy/               失败实验保留（不在 hot path）
+    ├── test_fused_backward.py  A.2 atomic-fused（净负，未用）
+    └── test_grouped_forward.py A.1 multi-head fusion（spill，未用）
+
+benchmarks/
+├── README.md                   分类 + commit workflow + 测量注意事项
+├── attn_only_all_n.py          ⭐ 典藏 kernel-only 全 N 全 config sweep (支持 --quick)
+├── real_gemma4_fwdbwd.py       ⭐ 真实 Gemma-4-E2B training throughput
+├── run_final_benchmark.py      ⭐ Release bench + 生成图
+├── replot.py                   从 results.json 重绘
+├── profile_*.py                Profiling (短/长 N, SWA, D=512)
+├── bwd_breakdown.py / diag_short_n.py / dump_kernel_regs.py
+├── alloc_overhead.py / triton_launch_overhead.py
+└── archive/                    已落地的 sweep 脚本（除非 kernel 结构变，一般不跑）
+    ├── dkv_*_sweep.py, dq_*_sweep.py  config 调优
+    ├── dkv_stages_sweep.py, dkv_split_bench.py  FAILED 实验
+    └── swa_e2e_bench.py        N-gate 开发 bench
+
 pyproject.toml            package 元数据，`pip install -e .` 即可安装为 `gemma-triton-flash-attn`
 requirements.txt          集成测试依赖 (torch 2.9.1 + transformers 5.5.4 + accelerate 等)
 README.md                 包说明、性能总结、用法示例
-.gitignore                排除 __pycache__, *.egg-info, dev docs 等
 context/index.md          所有模块摘要，每次启动必读
 context/baseline.md       量化基准数据（附测量条件）
 context/arch.md           架构与关键路径
@@ -291,6 +446,23 @@ context/hotspots.md       profiling 结论与热点清单
 skills/skills.md          可复用经验索引，先查这里
 tutorial/flash_attn.md    Triton flash attention 完整教程（从原理到 SWA 实现）
 ```
+
+## Commit workflow（tiered）
+
+每次动 kernel 代码按这 4 层跑。详见 `tests/README.md` + `benchmarks/README.md`。
+
+| Tier | 何时跑 | 预期时间 | 命令 |
+|------|--------|----------|------|
+| 0. Smoke | 每次 commit | <1 min | `python tests/test_packed_dkv.py` |
+| 1. Perf 回归 | 碰 kernel perf 的 commit | 2-3 min | `python benchmarks/attn_only_all_n.py --quick` |
+| 2. Full bench | Major refactor / 发版前 | ~20 min | `python benchmarks/attn_only_all_n.py` + `python benchmarks/run_final_benchmark.py` |
+| 3. 真实模型集成 | 发版前 | 10+ min | clean env + `tests/gemma4_integration/*.py` + `benchmarks/real_gemma4_fwdbwd.py` |
+
+**硬性规则**：
+- Tier 0 必须 PASS 才能 commit
+- Tier 1 如果任何 config N 回退 >5% 必须先 investigate
+- 跑出的 JSON (`*.json`) 保留在 `benchmarks/` 根，作为"上次的数字"对比基准
+- Tier 2 跑完要更新 `context/baseline.md` 的表格（如果数字改了）
 
 ## Shell 命令规范
 ### 禁止使用的组合符

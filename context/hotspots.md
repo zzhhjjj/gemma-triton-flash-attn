@@ -66,6 +66,8 @@
 | dKV spill 可通过 block/warps/stages 调优消除 | **4 次实验全败 (2026-04-17)**，详见下方"dKV 四次攻坚"section |
 | dKV spill 由 GQA loop code duplication 引起 | `tl.range` (dynamic) 对比 `tl.static_range` (unrolled)：spills 300 vs 302，基本不变。unroll 不是 spill 根因 |
 | split dK/dV 能 beat packed | spills 大减 (302 → 46/92) 但总时间 +35-36%。compute sharing (scores+p) 比消 spill 更值 |
+| atomic_add dKV 永远赔本 | **2026-04-17 翻案**：Config A (H_KV=16) 下确实慢 3-5%，但 Config B (H_KV=1 raw_grid=32) 下 Q_SPLIT=8 dKV -44%。grid-gated 启用才是对的 |
+| Config A 短 N 必须用 BKV=32 | **2026-04-17 翻案**：原先结论基于 "BKV=64 短 N grid starves SMs"，但那对 H_KV=1 成立；Config A H_KV=16 时 grid@BKV=64 = N/64 × 16 ≥ 256 健康。改用 BKV=64 BQ=128 w=8 s=1 后 dKV 减 23-35%，Config A N≥2K beats SDPA |
 
 ---
 

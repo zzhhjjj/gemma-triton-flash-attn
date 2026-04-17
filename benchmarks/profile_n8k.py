@@ -229,11 +229,12 @@ def run(N, B=1, H_Q=32, H_KV=4, D=512, causal=True, slide_size=0,
 
     def run_dq():
         _flash_attn_gqa_bwd_dq_kernel[grid_dq](
-            q, k, v, do, dq, lse, delta,
+            q, k, v, do, o, dq, lse, delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
             lse.stride(0), lse.stride(1), lse.stride(2),
             delta.stride(0), delta.stride(1), delta.stride(2),
@@ -242,6 +243,7 @@ def run(N, B=1, H_Q=32, H_KV=4, D=512, causal=True, slide_size=0,
             BLOCK_Q=BQ_dq, BLOCK_KV=BKV_dq,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
+            STORE_DELTA=False,
             num_warps=w_dq, num_stages=2,
         )
     t_dq = time_cuda(run_dq, warmup, rep)
@@ -274,6 +276,7 @@ def run(N, B=1, H_Q=32, H_KV=4, D=512, causal=True, slide_size=0,
             GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
+            Q_SPLITS=1,
             num_warps=w_dkv, num_stages=2,
         )
     t_dkv = time_cuda(run_dkv, warmup, rep)

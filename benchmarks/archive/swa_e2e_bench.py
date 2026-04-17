@@ -13,7 +13,7 @@ import json
 import torch
 import triton
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from flash_attn.attention import flash_attn_gqa_train, attention_gqa_ref
 

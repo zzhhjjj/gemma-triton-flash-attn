@@ -12,7 +12,7 @@ import json
 import torch
 import triton
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from flash_attn.attention import (
     _flash_attn_gqa_kernel,
@@ -102,6 +102,7 @@ def try_config(q, k, v, do, lse, delta, BQ, BKV, warps, stages, causal):
             BLOCK_Q=BQ, BLOCK_KV=BKV,
             GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal, SLIDE_SIZE=0,
+            Q_SPLITS=1,
             num_warps=warps, num_stages=stages,
         )
     try:

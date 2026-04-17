@@ -95,11 +95,12 @@ def run_dq(q, k, v, o, lse, H_Q, H_KV, N, D, causal=True):
     BKV = min(BKV, triton.next_power_of_2(N))
     grid = (triton.cdiv(N, BQ), 1 * H_Q)
     _flash_attn_gqa_bwd_dq_kernel[grid](
-        q, k, v, do, dq, lse, delta,
+        q, k, v, do, o, dq, lse, delta,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         delta.stride(0), delta.stride(1), delta.stride(2),
@@ -107,6 +108,7 @@ def run_dq(q, k, v, o, lse, H_Q, H_KV, N, D, causal=True):
         HEAD_DIM=D, scale=1.0 / math.sqrt(D),
         BLOCK_Q=BQ, BLOCK_KV=BKV,
         IS_CAUSAL=causal, SLIDE_SIZE=0,
+        STORE_DELTA=False,
         num_warps=w, num_stages=2,
     )
     torch.cuda.synchronize()
@@ -138,6 +140,7 @@ def run_dkv(q, k, v, o, lse, do, delta, H_Q, H_KV, N, D, causal=True):
         HEAD_DIM=D, scale=1.0 / math.sqrt(D),
         BLOCK_Q=BQ, BLOCK_KV=BKV, GQA_RATIO=GQA_RATIO,
         IS_CAUSAL=causal, SLIDE_SIZE=0,
+        Q_SPLITS=1,
         num_warps=w, num_stages=2,
     )
     torch.cuda.synchronize()

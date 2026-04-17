@@ -96,17 +96,19 @@ def run_backward_split(q, k, v, do, o, lse, *, causal, slide_size):
     BKV_dq = min(BKV_dq, triton.next_power_of_2(N))
 
     _flash_attn_gqa_bwd_dq_kernel[(triton.cdiv(N, BQ_dq), B * H_Q)](
-        q, k, v, do, dq, lse, delta,
+        q, k, v, do, o, dq, lse, delta,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         delta.stride(0), delta.stride(1), delta.stride(2),
         N_Q_HEADS=H_Q, N_KV_HEADS=H_KV, SEQ_LEN=N, HEAD_DIM=D, scale=scale,
         BLOCK_Q=BQ_dq, BLOCK_KV=BKV_dq,
         IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+        STORE_DELTA=False,
         num_warps=nw_dq, num_stages=2,
     )
 

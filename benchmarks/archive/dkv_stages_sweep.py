@@ -16,7 +16,7 @@ import sys
 import torch
 import triton
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from flash_attn.attention import (
     _flash_attn_gqa_kernel,
@@ -111,6 +111,7 @@ def bench_dkv(q, k, v, o, lse, do, delta, H_Q, H_KV, N, D,
             HEAD_DIM=D, scale=1.0 / math.sqrt(D),
             BLOCK_Q=BQ, BLOCK_KV=BKV, GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal, SLIDE_SIZE=0,
+            Q_SPLITS=1,
             num_warps=w, num_stages=s,
         )
     t = time_cuda(run, warmup=warmup, rep=rep)

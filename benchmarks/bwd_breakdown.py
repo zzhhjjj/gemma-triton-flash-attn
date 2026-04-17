@@ -114,11 +114,12 @@ def run_breakdown(B, H_Q, H_KV, N, D, dtype=torch.float16, causal=True, slide_si
 
     def run_dq():
         _flash_attn_gqa_bwd_dq_kernel[grid_dq](
-            qn, kn, vn, do, dq, lse, delta,
+            qn, kn, vn, do, o_ref, dq, lse, delta,
             qn.stride(0), qn.stride(1), qn.stride(2), qn.stride(3),
             kn.stride(0), kn.stride(1), kn.stride(2), kn.stride(3),
             vn.stride(0), vn.stride(1), vn.stride(2), vn.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            o_ref.stride(0), o_ref.stride(1), o_ref.stride(2), o_ref.stride(3),
             dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
             lse.stride(0), lse.stride(1), lse.stride(2),
             delta.stride(0), delta.stride(1), delta.stride(2),
@@ -127,6 +128,7 @@ def run_breakdown(B, H_Q, H_KV, N, D, dtype=torch.float16, causal=True, slide_si
             BLOCK_Q=BQ_dq, BLOCK_KV=BKV_dq,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
+            STORE_DELTA=False,
             num_warps=w_dq, num_stages=2,
         )
     t_dq = time_cuda(run_dq, warmup=warmup, rep=rep)
@@ -160,6 +162,7 @@ def run_breakdown(B, H_Q, H_KV, N, D, dtype=torch.float16, causal=True, slide_si
             GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
+            Q_SPLITS=1,
             num_warps=w_dkv, num_stages=2,
         )
     t_dkv = time_cuda(run_dkv, warmup=warmup, rep=rep)

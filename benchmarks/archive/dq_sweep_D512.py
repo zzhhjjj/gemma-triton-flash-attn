@@ -17,7 +17,7 @@ import json
 import torch
 import triton
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from flash_attn.attention import (
     _flash_attn_gqa_kernel,
@@ -88,11 +88,13 @@ def try_dq(q, k, v, do, lse, delta, BQ, BKV, warps, stages, causal):
     grid = (triton.cdiv(N, BQ), B * H_Q)
 
     def run():
+        # STORE_DELTA=False: O_ptr is dead-code-eliminated; pass do as dummy.
         _flash_attn_gqa_bwd_dq_kernel[grid](
-            q, k, v, do, dq, lse, delta,
+            q, k, v, do, do, dq, lse, delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
             dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
             lse.stride(0), lse.stride(1), lse.stride(2),
@@ -101,6 +103,7 @@ def try_dq(q, k, v, do, lse, delta, BQ, BKV, warps, stages, causal):
             HEAD_DIM=D, scale=scale,
             BLOCK_Q=BQ, BLOCK_KV=BKV,
             IS_CAUSAL=causal, SLIDE_SIZE=0,
+            STORE_DELTA=False,
             num_warps=warps, num_stages=stages,
         )
     try:

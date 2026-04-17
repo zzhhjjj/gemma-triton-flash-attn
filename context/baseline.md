@@ -1169,3 +1169,426 @@ Reproducer:
   `swa_e2e_bench_{before,after,ngate}.json`
 
 ---
+
+### 短 N 专项 + Delta Fusion into dQ (2026-04-17)
+
+**动机**：claude.md 标注 "剩余不足: N≤2K 仍 0.73-0.88x"。进一步 profiling 诊断根因并尝试
+低风险优化。
+
+#### 诊断（`benchmarks/profile_short_n.py`, `diag_short_n.py`）
+
+**硬件**: H100 80GB (contaminated — 训练任务同时在跑，ratio 可信，绝对时间有噪声)
+
+**Fused before:** (Config A = synthetic Gemma4 sliding: B=1, H_Q=32, H_KV=16, D=256, slide=1024)
+| N | fwd | delta | dQ | dKV | K_sum | Triton F+B | OH% | SDPA F+B | s_fwd | s_fb | s_bwd |
+|---|-----|-------|-----|-----|-------|-----|-----|------|--------|--------|--------|
+| 1K | 0.115 | 0.046 | 0.155 | 0.283 | 0.598 | 0.604 | 0.8% | 0.430 | 0.81× | 0.71× | 0.68× |
+| 2K | 0.224 | 0.065 | 0.303 | 0.643 | 1.235 | 1.179 | 0.0% | 0.990 | 1.00× | 0.84× | 0.80× |
+| 4K | 0.421 | 0.106 | 0.601 | 1.351 | 2.480 | 2.393 | 0.0% | 3.023 | 1.50× | 1.26× | 1.21× |
+
+**Fused before:** (Config B = Gemma-4-E2B real sliding: B=1, H_Q=8, H_KV=1, D=256, slide=512)
+| N | Triton F+B | OH | OH% | SDPA F+B | s_fb |
+|---|-----|-----|-----|------|--------|
+| 1K | 0.539 | 0.100 | **18.6%** | 0.257 | 0.48× |
+| 2K | 0.544 | 0.086 | 15.8% | 0.385 | 0.71× |
+| 4K | 0.606 | 0.035 | 5.8% | 0.875 | 1.44× |
+
+#### 根因
+
+1. **Forward 已打平 cuDNN** (Config A N=1K: Triton 0.115ms vs cuDNN 0.114ms)，**gap 全在 bwd**
+2. **SDPA 走 cuDNN**，不是 FA2（FA2 比 cuDNN 慢 40% @ 短 N）
+3. **Config B dKV SM starvation**: grid = `(N/BKV, H_KV)` = `(32, 1) = 32 programs` @ N=1K
+   = **24% of H100 132 SMs**. dKV time N=1K→2K: 0.273→0.270ms（几乎不变，fixed overhead）
+4. **Launch overhead floor**: noop Triton kernel ≈ 19μs；bwd 有 delta + dQ + dKV = 3 launches,
+   加 fwd 总 4 launches ≈ 76μs ≈ **12-14% of fwd+bwd @ N=1K**
+
+#### 优化：Delta Fused into dQ Prologue
+
+**思路**：dQ kernel 反正要 load `dO`，顺便 load `O` 算 `rowsum(dO*O)`，在 prologue 存
+Delta buffer 给 dKV 用。省掉 `_delta_kernel` 整个 launch（其 grid = N × B × H_Q 个 tiny
+program，launch-bound 严重）。
+
+**API 改动**（`flash_attn/attention.py`）：
+- `_flash_attn_gqa_bwd_dq_kernel` 新增参数：`O_ptr`, 4 个 O stride, `STORE_DELTA: tl.constexpr`
+- 当 `STORE_DELTA=True`：prologue 内 `tl.sum(do.float() * o.float(), axis=1)` → `tl.store(Delta)`
+- 当 `STORE_DELTA=False`：保持原行为，从 Delta buffer load（benchmark / 隔离 kernel 测试用）
+- 主 backward wrapper 切到 `STORE_DELTA=True` 并移除 `_delta_kernel` launch
+
+**正确性**: fp32 cos sim（fp16 不行，见 skills/2026-04-17_fp16-cossim-pitfall.md）
+
+| Config | N | slide | cos(out) | cos(dQ) | cos(dK) | cos(dV) |
+|--------|---|-------|----------|---------|---------|---------|
+| 32:16, D=256 | 1K | ≥N→0 | 0.99999994 | 0.99999994 | 0.99999988 | 1.0 |
+| 32:4,  D=512 | 1K | 0 | 1.0 | 1.0 | 0.99999994 | 0.99999994 |
+| 32:4,  D=512 | 2K | 0 | 1.00000012 | 0.99999976 | 0.99999988 | 0.99999988 |
+
+SWA cases 验证无 NaN（SDPA 不支持 SWA，不能直接对比）。
+
+#### 性能（fused-before vs fused-after，同一脚本同一条件）
+
+**Config A — Gemma4 synthetic (H_Q=32, H_KV=16, D=256, slide=1024)**:
+| N | Before F+B | **After F+B** | Δ | Before s_fb | **After s_fb** |
+|---|------------|---------------|------|-------------|----------------|
+| 1K | 0.604 ms | **0.581 ms** | **-23μs (-3.8%)** | 0.71× | **0.74×** |
+| 2K | 1.179 ms | 1.144 ms | -35μs (-3.0%) | 0.84× | **0.86×** |
+| 4K | 2.393 ms | 2.330 ms | -63μs (-2.6%) | 1.26× | **1.30×** |
+
+**Config B — Gemma-4-E2B real (H_Q=8, H_KV=1, D=256, slide=512)**:
+| N | Before F+B | **After F+B** | Δ | Before s_fb | **After s_fb** |
+|---|------------|---------------|------|-------------|----------------|
+| 1K | 0.539 ms | **0.507 ms** | **-32μs (-5.9%)** | 0.48× | **0.51×** |
+| 2K | 0.544 ms | 0.516 ms | -28μs (-5.1%) | 0.71× | **0.75×** |
+| 4K | 0.606 ms | 0.582 ms | -24μs (-4.0%) | 1.44× | **1.49×** |
+
+Config B N=1K **overhead% 18.6% → 13.2%**（delta launch 被消掉，~5% 减少）。
+
+**符合预期**：standalone `_delta_kernel` 时间 ≈ 46μs @ N=1K Config A；融合进 dQ 后新增的
+`O` load 成本 ≈ 23μs；净省 23μs = **实测一致**。
+
+#### 剩余 gap 与可行方向
+
+已确认 N≤2K 剩余 gap 的主要来源（按大小）：
+1. **dKV kernel 效率不敌 cuDNN ~30-50%**（同等工作量下）
+2. **Config B dKV SM starvation**（GQA 8:1 + H_KV=1 下 grid 只有 32 programs @ N=1K）
+3. **3 launches 的 floor overhead**（~57μs）
+
+候选方向（未做）：
+- Config B dKV split-KV（风险：之前 atomic_add 实验失败，但短 N SM idle 严重可能反转 tradeoff）
+- CUDA Graph 包裹（需要 static shapes，改 API）
+- Bwd 融成 1 kernel（工程量大）
+
+Reproducer:
+- `python benchmarks/profile_short_n.py` (profile + breakdown)
+- `python benchmarks/diag_short_n.py` (SM 占用、SDPA backend 检测)
+- 结果 JSON: `benchmarks/profile_short_n.json`
+
+---
+
+### Q_SPLIT dKV (2026-04-17) — Config B SM starvation 攻坚成功
+
+**动机**：上节 "候选方向 2" 里写的 Config B dKV split-KV，虽然 2026-04-16 同类
+atomic_add fuse 在 Config A 失败（GQA=2:1 grid 健康，atomic 只添乱），但 Config B
+(H_KV=1, raw_grid=32 @ N=1K, 24% SM util) 下 tradeoff 可能反转 — 直接做实验验证。
+
+#### 设计
+Pack-GQA dKV kernel 加 `Q_SPLITS: tl.constexpr`：
+- Grid 从 `(cdiv(N, BKV), B × H_KV)` 改为 `(cdiv(N, BKV), B × H_KV, Q_SPLITS)`
+- 每个 program 根据 `program_id(2)` 切一段 Q 范围 `[q_lo, q_hi)`
+- QS>1 时输出从 `tl.store` 换为 `tl.atomic_add`，调用方预 zero `dk`/`dv`
+- QS=1 时保持原逻辑（direct store）
+
+#### 启发式（`benchmarks/dkv_qsplits_sweep.py` 实测 tuned）
+
+目标：~256 programs = 2 waves on 132 SMs
+
+```python
+raw_grid = triton.cdiv(N, BLOCK_KV) * B * H_KV
+if raw_grid >= 256:   Q_SPLITS = 1
+elif raw_grid >= 128: Q_SPLITS = 2
+elif raw_grid >= 64:  Q_SPLITS = 4
+else:                 Q_SPLITS = 8
+```
+
+#### Q_SPLITS sweep (Config B, dKV kernel only, ms)
+
+| N | raw_grid | QS=1 | QS=2 | QS=4 | QS=8 | best | vs QS=1 |
+|---|----------|------|------|------|------|------|---------|
+| 1K | 32 | 0.271 | 0.208 | 0.167 | **0.151** | QS=8 | **-44%** |
+| 2K | 64 | 0.273 | 0.213 | **0.192** | 0.282 | QS=4 | **-30%** |
+| 4K | 128 | 0.296 | **0.249** | 0.360 | 0.477 | QS=2 | **-16%** |
+| 8K | 256 | **0.360** | 0.485 | 0.670 | 0.930 | QS=1 | 0% (sat) |
+
+Config A (H_Q=32, H_KV=16): raw_grid ≥ 512 at all N → QS=1 永远最优；sweep 确认
+QS>1 在 healthy grid 下慢 5-110%（atomic 开销毫无收益）。
+
+#### 累计 fwd+bwd vs SDPA (Config B, Gemma-4-E2B 8:1, D=256, slide=512)
+
+| N | Pre-fusion (2026-04-17 开局) | + Delta fusion | + Q_SPLIT | 累计 Δ |
+|---|---|---|---|---|
+| 1K | 0.48× | 0.51× | **0.63×** | **+31%** |
+| 2K | 0.71× | 0.75× | **0.87×** | **+23%** |
+| 4K | 1.44× | 1.49× | **1.65×** | **+15%** |
+
+Config A (H_KV=16) 路径不变（QS=1 保留），fwd+bwd 数字与 delta-fusion 后一致。
+
+#### 正确性
+
+fp32 cos sim ≥ 0.99999982 across 8 shape configs（Config B QS=8 路径 + Config A
+QS=1 路径 + D=512 full causal）。`test_packed_dkv.py` PASS all 7 correctness checks.
+
+#### 为什么 2026-04-16 "atomic fuse 失败" 不矛盾
+
+旧实验 (Config A H_KV=16, GQA=2:1) 下 raw_grid=512 @ N=1K 已饱和 SMs — atomic_add
+纯添乱。新实验 (Config B H_KV=1) 下 raw_grid=32 @ N=1K 只用 24% SMs — SM 空转浪费
+远超 atomic 竞争代价。**gated on raw_grid** 是关键：两种场景都用正确路径。
+
+Reproducer:
+- Sweep:     `python benchmarks/dkv_qsplits_sweep.py`
+- Profile:   `python benchmarks/profile_short_n.py`
+- 结果 JSON: `benchmarks/profile_short_n.json`
+
+---
+
+### Config A 短 N BKV=64 翻盘 (2026-04-17)
+
+**动机**：上节 Q_SPLIT 专攻 Config B；但 Config A (H_Q=32, H_KV=16) 在短 N 仍
+0.74-0.86× vs SDPA。根因是否在 dKV block config 错配？
+
+#### 诊断
+
+现有 D<512 短 N 默认 (BKV=32, BQ=64, w=4, s=2) 来自 2026-04-16，动机是 "BKV=64
+短 N 会 starve SMs"。但那个论断 tested 在哪里？查 claude.md 发现基于 Gemma-4-E2B
+(H_KV=1) 的数据 — raw_grid = N/64 × 1 = 16 @ N=1K 确实 starved。**推广到
+Config A 是错误的**：Config A H_KV=16，raw_grid = N/64 × 16 = 256 @ N=1K，健康。
+
+#### Config A sweep (`dkv_config_a_sweep.py`)
+
+BKV ∈ {32, 64} × BQ ∈ {32, 64, 128} × w ∈ {4, 8} × s ∈ {1, 2}
+@ (H_Q=32, H_KV=16, D=256, slide=1024)
+
+| N | 当前 (32,64,4,s=2) | TOP (64,128,8,s=1) | 降幅 |
+|---|-------------------|---------------------|------|
+| 1K | 0.286 ms | **0.219 ms** | -23% |
+| 2K | 0.653 ms | **0.454 ms** | -30% |
+| 4K | 1.353 ms | **0.882 ms** | -35% |
+
+**TOP 5 一致**：`(64, 128, 8, s=1)` 在 N=1K/2K/4K 全部第一；`(32, 128, 8, s=2)`
+第二。现有 `(32, 64, 4, s=2)` 排 #3 across all N.
+
+#### 修复
+
+Gate 改成 `grid_at_BKV=64 = cdiv(N, 64) × B × H_KV >= 128`：
+- Config A all N: 满足 → `(BKV=64, BQ=128, w=8, s=1)`
+- Config B all N: 不满足 → `(BKV=32, BQ=64, w=4, s=2)` + Q_SPLITS 救援
+
+#### End-to-end fwd+bwd vs SDPA (Config A, Gemma4 syn 2:1)
+
+| N | Before (post-Q_SPLIT) | **After BKV=64** | Δ |
+|---|------------------------|-------------------|------|
+| 1K | 0.74× (0.596 ms) | **0.83× (0.520 ms)** | +12% |
+| 2K | 0.86× (1.152 ms) | **1.05× (0.944 ms)** | +22% |
+| 4K | 1.30× (2.342 ms) | **1.61× (1.874 ms)** | +24% |
+
+**N=2K crosses SDPA** (1.05×, first time with this config).
+
+Config B 路径 0.67×/0.88×/1.65× 不变（gate 正确保留了 BKV=32 + QS=8 路径）。
+
+#### 正确性
+
+fp32 cos sim ≥ 0.99999988 across 8 shape configs (Config A BKV=64 path +
+Config B BKV=32 QS=8 path + D=512 unchanged path).
+
+#### 翻案的系统性教训
+
+原 2026-04-16 "短 N BKV=64 starves SMs" 结论是基于 Gemma-4-E2B 测的，但那是
+H_KV=1 的极端场景。被推广到所有 D<512 短 N (包括 H_KV=16) → 误配持续了整个 4 月。
+Gate 应该基于 **raw grid** 而不是 **N 单维**；H_KV 是和 N 同等重要的 grid 因子。
+
+Reproducer:
+- `python benchmarks/dkv_config_a_sweep.py`
+- 用新 wrapper: `python benchmarks/profile_short_n.py`
+
+---
+
+### Session Summary — 2026-04-17 三步优化组合拳
+
+短 N gap 攻坚的三个正交优化，累计效果：
+
+**Config A (Gemma4 syn, H_Q=32, H_KV=16, D=256, slide=1024)**:
+| N | 开局 | + Delta fusion | + Q_SPLIT (no-op A) | + BKV=64 | 累计 |
+|---|------|----------------|---------------------|----------|------|
+| 1K | 0.71× | 0.74× | 0.74× | **0.83×** | **+17%** |
+| 2K | 0.84× | 0.86× | 0.86× | **1.05×** | **+25% (beats SDPA)** |
+| 4K | 1.26× | 1.30× | 1.30× | **1.61×** | **+28%** |
+
+**Config B (Gemma-4-E2B, H_Q=8, H_KV=1, D=256, slide=512)**:
+| N | 开局 | + Delta fusion | + Q_SPLIT | + BKV=64 Config A gate | + BKV=64 rescue @ starve | 累计 |
+|---|------|----------------|-----------|-------------------------|--------------------------|------|
+| 1K | 0.48× | 0.51× | **0.63×** | 0.67× | **0.66×**（Triton 时间 -4%）| **+40%** |
+| 2K | 0.71× | 0.75× | **0.87×** | 0.88× | 0.85×（noise）| **+24%** |
+| 4K | 1.44× | 1.49× | **1.65×** | 1.65× | **1.68×** | **+17%** |
+
+四个优化互补无干扰：每个 config 各走自己的 gate 路径，正确性保持。
+
+### E2E Training Throughput Validation — 2026-04-17
+
+**动机**：所有前述优化都是 kernel 级别。需验证在真实训练 stack（含 linear projections,
+LayerNorm, AdamW optimizer, MSE loss）里是否有对应增益。
+
+#### 合成 Gemma4 stack（`flash_attn/gemma4_e2e.py`）
+
+配置：d_model=2048, 6 blocks (5 slide Config A + 1 full D=512), BF16, AdamW, 10 steps.
+
+**正确性**: N=512/1024/2048 全部 PASS, loss trajectory **bit-exact** (0 rel diff).
+
+**Training throughput (ms/step) — SDPA vs Triton**:
+
+| N | SDPA | Triton **After** | Triton **Before** (2026-04-16) | Speedup **After** | Speedup **Before** | Δ |
+|---|------|------------------|--------------------------------|-------------------|---------------------|---|
+| 512  | 12.46  | **11.24** | 11.77 | **1.11×** | 1.06× | +5% |
+| 1024 | 17.72  | **12.60** | 13.27 | **1.41×** | 1.35× | +4% |
+| 2048 | 37.88  | **20.48** | 22.85 | **1.85×** | 1.68× | +10% |
+| 4096 | 106.99 | **43.28** | 50.55 | **2.47×** | 2.13× | **+16%** |
+| 8192 | 362.25 | **116.35** | 140.64 | **3.11×** | 2.60× | **+20%** |
+
+**Absolute Triton savings per step**:
+- N=1K: 13.27 → 12.60 ms (-5%)
+- N=4K: 50.55 → **43.28 ms (-14%)**
+- N=8K: 140.64 → **116.35 ms (-17%)**
+
+**关键观察**：
+1. 所有 kernel 级优化（delta-fusion, Q_SPLIT, BKV=64 big-tile, BKV=64 rescue）
+   都在 E2E stack 里**真实生效** — 这不只是 benchmark 数字，而是 end-to-end
+   training 时间真的缩短。
+2. **长 N 增益更大**（+20% @ N=8K vs +4% @ N=1K）：因为长 N 下 attention 占 step
+   比重大（MLP + linear proj 的 O(N) 部分相对小），所以 attention 优化 leverage 更高。
+3. Config A 的 BKV=64 大 tile 优化在 synthetic Gemma4 里格外显著：这是 primary
+   layer type (5/6 blocks 是 sliding Config A)。
+
+#### 真实 Gemma-4-E2B 模型（5.1B params）
+
+配置：Gemma-4-E2B 35 层 (29 sliding + 6 full), H_Q=8 H_KV=1 GQA 8:1, head_dim=256.
+环境：`/opt/tiger/flash_gemma` (torch 2.9.1, transformers 5.5.4, triton 3.5.1).
+
+**Forward-only** (`tests/gemma4_integration/test_gemma4.py`):
+
+| N | SDPA (ms) | Triton (ms) | Speedup |
+|---|-----------|-------------|---------|
+| 512 | 40.99 | 41.44 | 0.99× |
+| 1024 | 42.93 | 43.03 | 1.00× |
+| 2048 | 62.98 | 46.95 | **1.34×** |
+
+Correctness: N=1024 cos sim **0.999758**, top-1 **100%**, top-5 **5/5 match**, PASS.
+
+**Training-style fwd+bwd + AdamW step** (`benchmarks/real_gemma4_fwdbwd.py`, 新增)：
+
+| N | SDPA (ms) | Triton (ms) | **Speedup** | 备注 |
+|---|-----------|-------------|-------------|------|
+| 512 | 203.13 | 214.83 | 0.95× | linear proj dominant |
+| 1024 | 222.76 | **211.61** | **1.05×** | 首次在 N=1K 超越 SDPA |
+| 2048 | 377.59 | **246.74** | **1.53×** | attention 开始 dominant |
+| 4096 | 816.91 | **357.67** | **2.28×** | |
+
+**训练时真实收益拆解**：
+- N=1K training: SDPA 被 Triton 超越 (1.05×)
+- N=2K training: **1.53× 总 step 加速** — 每个 step 省 131ms
+- N=4K training: **2.28× 加速** — 每个 step 省 459ms；长训练累计可省数小时
+- **N≥8K training: 5.1B 模型在 80GB H100 上 OOM**（fp32 AdamW state × 3 + activations），
+  需要 activation checkpointing / ZeRO / 多卡。此处不展示长 N training 数字
+
+#### Kernel-only benchmark 全 N 统一视图（2026-04-18, `attn_only_all_n.py`）
+
+纯 attention kernel (fwd/F+B/bwd), Triton vs SDPA, H100 FP16, no E2E overhead.
+
+**Config A — Gemma4 synthetic sliding** (H_Q=32, H_KV=16, D=256, slide=1024):
+| N | fwd (ms) | F+B (ms) | **fwd** | **F+B** | **bwd** |
+|---|---------|---------|---------|---------|---------|
+| 1K | 0.144 vs 0.115 | 0.526 vs 0.442 | 0.80× | 0.84× | 0.85× |
+| 2K | 0.253 vs 0.247 | 0.961 vs 0.980 | 0.98× | **1.02×** | 1.03× |
+| 4K | 0.447 vs 0.648 | 1.933 vs 3.018 | 1.45× | **1.56×** | 1.59× |
+| 8K | 0.869 vs 2.040 | 3.996 vs 10.498 | 2.35× | **2.63×** | 2.70× |
+| 16K | 1.733 vs 7.910 | 7.816 vs 41.276 | 4.56× | **5.28×** | 5.49× |
+| **32K** | 3.446 vs 30.056 | 15.767 vs 161.954 | **8.72×** | **10.27×** | **10.71×** |
+
+**Config B — Gemma-4-E2B real sliding** (H_Q=8, H_KV=1, D=256, slide=512):
+| N | fwd (ms) | F+B (ms) | **fwd** | **F+B** | **bwd** |
+|---|---------|---------|---------|---------|---------|
+| 1K | 0.097 vs 0.075 | 0.409 vs 0.273 | 0.78× | 0.67× | 0.64× |
+| 2K | 0.097 vs 0.099 | 0.462 vs 0.401 | 1.02× | 0.87× | 0.83× |
+| 4K | 0.128 vs 0.218 | 0.537 vs 0.874 | 1.70× | **1.63×** | 1.60× |
+| 8K | 0.200 vs 0.586 | 0.764 vs 2.512 | 2.94× | **3.29×** | 3.42× |
+| 16K | 0.335 vs 1.901 | 1.517 vs 10.287 | 5.68× | **6.78×** | 7.09× |
+| **32K** | 0.653 vs 7.433 | 3.224 vs 39.484 | **11.38×** | **12.25×** | **12.47×** |
+
+**Full-causal D=512** — Gemma4 full-attention config (H_Q=32, H_KV=4, D=512, no SWA):
+| N | fwd (ms) | F+B (ms) | **fwd** | **F+B** | **bwd** |
+|---|---------|---------|---------|---------|---------|
+| 1K | 0.372 vs 0.452 | 1.734 vs 5.000 | 1.21× | **2.88×** | 3.34× |
+| 2K | 0.994 vs 1.423 | 4.906 vs 14.284 | 1.43× | **2.91×** | 3.29× |
+| 4K | 3.346 vs 5.199 | 17.526 vs 46.169 | 1.55× | **2.63×** | 2.89× |
+| 8K | 12.360 vs 20.179 | 66.642 vs 164.449 | 1.63× | **2.47×** | 2.66× |
+| 16K | 47.582 vs 86.167 | 262.981 vs 626.026 | 1.81× | **2.38×** | 2.51× |
+| **32K** | 195.271 vs 403.306 | 1047.714 vs 2505.638 | 2.07× | **2.39×** | 2.47× |
+
+**观察**：
+1. **长 N 的 Triton 优势巨大**（Config A @ 32K F+B **10.27×**，Config B @ 32K **12.25×**）
+   — 因为 SWA 工作量为 O(N·slide) 而 full-causal SDPA 是 O(N²)
+2. **Full-causal D=512 是稳定 2.4-2.9× F+B speedup 跨全 N**
+   — 这类工作量是 O(N²) 两边相同，纯对比 kernel 效率
+3. **Config A N=1K** (0.84× F+B) 和 **Config B N=1K/2K** (0.67×/0.87×) 是仅有的
+   低于 SDPA 场景：短 N + SWA 下 SDPA 走 cuDNN fast path Triton 暂时不敌
+4. **Bwd 比 F+B 提升略高**（因为 fwd 被 cuDNN 拖累，但 Triton bwd 优势显著）
+
+#### 长 N (8K-32K) 扩展数据
+
+**合成 Gemma4 stack 训练 fwd+bwd**（d_model=2048，内存小，长 N 可跑）：
+
+| N | SDPA (ms/step) | Triton (ms/step) | **Speedup** |
+|---|----------------|-------------------|-------------|
+| 8K | 362.23 | 116.23 | **3.12×** |
+| 16K | 1368.11 | 358.53 | **3.82×** |
+| **32K** | 5422.94 | 1234.42 | **4.39×** — 每 step 省 **4.19 秒** |
+
+**真实 Gemma-4-E2B forward-only 长 N** (no_grad，inference-style):
+
+| N | SDPA (ms) | Triton (ms) | **Speedup** |
+|---|-----------|-------------|-------------|
+| 4K | 157.62 | 79.61 | **1.98×** |
+| 8K | 479.06 | 165.43 | **2.90×** |
+| 16K | 1620.82 | 363.36 | **4.46×** |
+| **32K** | **OOM** | **892.53** | **SDPA 跑不动** — Triton **独家支持 2× context** |
+
+**关键**：N=32K 真实 Gemma-4-E2B forward，**SDPA materialize attention matrix 爆显存**
+（80GB H100 不够），**Triton flash pattern 只要 892ms**。等效说 Triton 把 80GB 卡的
+**最大 context 从 16K 推到 32K**（long-context inference 场景的核心价值）。
+
+**为什么 Gemma-4-E2B forward-only 提升有限而 fwd+bwd 大**：
+- Gemma-4-E2B 5.1B 参数，35 层 linear projections (wq, wk, wv, wo, MLP) 主导 forward
+- 我们的优化 80% 集中在 bwd（dKV, dQ 的各种调优）
+- fwd+bwd 训练时 attention bwd 占 step 一大块，所以 Triton bwd 收益显性化
+- 长 N 下 attention O(N²) 占比上升，Triton 优势 further amplified
+
+---
+
+### BKV=64 rescue 细节（2026-04-17）
+
+Config B N=1K 下 `grid_at_BKV=64 = 16`（极度 starve）。sweep（`dkv_config_b_bkv64.py`）
+发现 BKV=64 BQ=128 w=8 s=1 + QS=8 反而更优：
+
+| Config B | BKV=32 QS=8 (current) | BKV=64 QS=8 (rescue) | Δ |
+|----------|----------------------|----------------------|------|
+| N=1K | 0.153 ms | **0.144 ms** | -6% |
+| N=2K | 0.196 ms | 0.194 ms | tied |
+| N=4K | 0.248 ms | 0.251 ms | +1% (tied) |
+
+原因：BKV=64 时大 tile 每 program 更大工作量，虽然 QS=8 增加 8-way atomic 竞争，
+但 tile 数量减半（16 vs 32 写入 dk/dv），总 atomic 代价反而降低；amortization 赢。
+
+**Gate 最终形式**（attention.py backward wrapper）：
+```python
+# BKV 选择
+grid_at_bkv64 = cdiv(N, 64) * B * H_KV
+if grid_at_bkv64 >= 128 or grid_at_bkv64 <= 16:
+    BKV, BQ, w, s = 64, 128, 8, 1  # big-tile (healthy OR extreme-starve rescue)
+else:
+    BKV, BQ, w, s = 32, 64, 4, 2   # middle regime (Config B N=2K/4K)
+
+# Q_SPLITS 选择（目标根据 BKV 分化）
+target = 128 if BKV == 64 else 256  # BKV=64 想 1 wave, BKV=32 想 2 waves
+raw = cdiv(N, BKV) * B * H_KV
+QS = 1 if raw >= target else 2 if raw*2 >= target else 4 if raw*4 >= target else 8
+```
+
+覆盖表（所有 config 都经过验证）:
+| Config, N | raw_BKV64 | raw_BKV32 | BKV 选择 | QS | grid |
+|-----------|-----------|-----------|----------|-----|------|
+| A (H_KV=16) N=1K | 256 | 512 | 64 | 1 | 256 |
+| A N=2K | 512 | 1024 | 64 | 1 | 512 |
+| A N=4K | 1024 | 2048 | 64 | 1 | 1024 |
+| B (H_KV=1) N=1K | 16 | 32 | 64 (rescue) | 8 | 128 |
+| B N=2K | 32 | 64 | 32 | 4 | 256 |
+| B N=4K | 64 | 128 | 32 | 2 | 256 |
+| B N=8K | 128 | 256 | 64 | 1 | 128 |
+| D=512 any | — | — | 16 | 1 | — |
+
+---
