@@ -1,0 +1,1460 @@
+{
+  "config": {
+    "B": 1,
+    "H_Q": 8,
+    "H_KV": 1,
+    "D": 256,
+    "dtype": "torch.float16"
+  },
+  "sweep_space": {
+    "BKVs": [
+      16,
+      32,
+      64
+    ],
+    "BQs": [
+      32,
+      64,
+      128
+    ],
+    "warps": [
+      4,
+      8
+    ],
+    "stages": [
+      1,
+      2,
+      3
+    ]
+  },
+  "shapes": {
+    "primary": {
+      "N": 16384,
+      "slide": 512,
+      "baseline_ms": 0.7773759961128235,
+      "results": [
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.5621119737625122,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.4510400295257568,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 1.426751971244812,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 2.4377920627593994,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.756959915161133,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.559328079223633,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.7303359508514404,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.1344000101089478,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 1.7861759662628174,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 2.3178560733795166,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.193056106567383,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.019167900085449,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 279552, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.6764800548553467,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 284672, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 278528, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.5846400260925293,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 284672, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 0.8877440094947815,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.2363519668579102,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 1.2340799570083618,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.5705920457839966,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.4619840383529663,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 1.3761919736862183,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.3191039562225342,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 0.7773759961128235,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 1.328927993774414,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.4952319860458374,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.4644800424575806,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 1.3791040182113647,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 295936, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.204864025115967,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 305152, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 294912, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 0.9904000163078308,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 305152, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.9867839813232422,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 3.5556480884552,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.485663890838623,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 0.921887993812561,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.3645119667053223,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 1.3911999464035034,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.56768000125885,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.4312959909439087,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 271360, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.067199945449829,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.0572160482406616,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 271360, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 2.489856004714966,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 345088, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 477184, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 0.6888960003852844,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 345088, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 477184, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        }
+      ]
+    },
+    "cross-N32K": {
+      "N": 32768,
+      "slide": 512,
+      "baseline_ms": 1.5483200550079346,
+      "results": [
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 3.0454719066619873,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.795743942260742,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.772736072540283,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 4.798816204071045,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 5.367487907409668,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 5.062975883483887,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 3.3260159492492676,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.266432046890259,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 3.553152084350586,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 4.440063953399658,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 4.503104209899902,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 4.119040012359619,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 279552, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 5.283904075622559,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 284672, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 278528, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 3.1978559494018555,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 284672, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.730463981628418,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.414112091064453,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.4066240787506104,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 3.1468160152435303,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.923680067062378,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.696671962738037,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 2.6432321071624756,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.5483200550079346,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.679903984069824,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 3.0042879581451416,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.954400062561035,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.7535040378570557,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 295936, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 4.539519786834717,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 305152, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 294912, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.9819200038909912,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 305152, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 3.8986239433288574,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 7.0029120445251465,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 5.311967849731445,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.766495943069458,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.657536029815674,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.707520008087158,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 3.326335906982422,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.889472007751465,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 271360, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 2.0617918968200684,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.18393611907959,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 271360, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 5.083648204803467,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 345088, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 477184, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.4065920114517212,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 345088, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 477184, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        }
+      ]
+    },
+    "cross-slide1024": {
+      "N": 16384,
+      "slide": 1024,
+      "baseline_ms": 1.249343991279602,
+      "results": [
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 2.9690239429473877,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.694783926010132,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.64736008644104,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 4.663584232330322,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 5.321184158325195,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 4.86572790145874,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 3.161760091781616,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.8327360153198242,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.7518720626831055,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 4.178175926208496,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 3.775264024734497,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 3.4768640995025635,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 279552, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 3.920383930206299,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 284672, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 278528, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.590816020965576,
+          "err": null
+        },
+        {
+          "BKV": 16,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 284672, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 1.6502399444580078,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.300031900405884,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.279263973236084,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 3.0214719772338867,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.8101439476013184,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.5721280574798584,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 2.2210559844970703,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 1.249343991279602,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 2.094912052154541,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 2.5332798957824707,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.4085440635681152,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.2869760990142822,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 295936, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 3.6389760971069336,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 305152, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 294912, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.556704044342041,
+          "err": null
+        },
+        {
+          "BKV": 32,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 305152, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 3.6380159854888916,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 6.356991767883301,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": 4.805791854858398,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.6584960222244263,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 2.480448007583618,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 32,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": 2.5348799228668213,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 2.997760057449341,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": 2.4779839515686035,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 271360, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.725376009941101,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": 1.7729599475860596,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 64,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 271360, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 1,
+          "time_ms": 4.400576114654541,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 2,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 345088, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 4,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 477184, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 1,
+          "time_ms": 1.0924479961395264,
+          "err": null
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 2,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 345088, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        },
+        {
+          "BKV": 64,
+          "BQ": 128,
+          "warps": 8,
+          "stages": 3,
+          "time_ms": null,
+          "err": "out of resource: shared memory, Required: 477184, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+        }
+      ]
+    }
+  },
+  "baselines_ms": {
+    "primary": 0.7773759961128235,
+    "cross-N32K": 1.5483200550079346,
+    "cross-slide1024": 1.249343991279602
+  },
+  "cross_shape_ranking": [
+    {
+      "BKV": 64,
+      "BQ": 128,
+      "warps": 8,
+      "stages": 1,
+      "geom_time_ms": 1.019156457955967,
+      "speedup_vs_baseline": 1.1241314678245955,
+      "times": [
+        0.6888960003852844,
+        1.4065920114517212,
+        1.0924479961395264
+      ]
+    },
+    {
+      "BKV": 32,
+      "BQ": 64,
+      "warps": 4,
+      "stages": 2,
+      "geom_time_ms": 1.145665845024957,
+      "speedup_vs_baseline": 1.0,
+      "times": [
+        0.7773759961128235,
+        1.5483200550079346,
+        1.249343991279602
+      ]
+    },
+    {
+      "BKV": 32,
+      "BQ": 32,
+      "warps": 4,
+      "stages": 1,
+      "geom_time_ms": 1.3635334712412934,
+      "speedup_vs_baseline": 0.8402183512092296,
+      "times": [
+        0.8877440094947815,
+        1.730463981628418,
+        1.6502399444580078
+      ]
+    },
+    {
+      "BKV": 64,
+      "BQ": 32,
+      "warps": 8,
+      "stages": 1,
+      "geom_time_ms": 1.3926278601967226,
+      "speedup_vs_baseline": 0.8226647461031839,
+      "times": [
+        0.921887993812561,
+        1.766495943069458,
+        1.6584960222244263
+      ]
+    },
+    {
+      "BKV": 32,
+      "BQ": 128,
+      "warps": 8,
+      "stages": 2,
+      "geom_time_ms": 1.4511120145460612,
+      "speedup_vs_baseline": 0.789508896308977,
+      "times": [
+        0.9904000163078308,
+        1.9819200038909912,
+        1.556704044342041
+      ]
+    },
+    {
+      "BKV": 64,
+      "BQ": 64,
+      "warps": 8,
+      "stages": 1,
+      "geom_time_ms": 1.5600006980018692,
+      "speedup_vs_baseline": 0.7344008541101206,
+      "times": [
+        1.067199945449829,
+        2.0617918968200684,
+        1.725376009941101
+      ]
+    },
+    {
+      "BKV": 64,
+      "BQ": 64,
+      "warps": 8,
+      "stages": 2,
+      "geom_time_ms": 1.5996839994414083,
+      "speedup_vs_baseline": 0.7161825994540238,
+      "times": [
+        1.0572160482406616,
+        2.18393611907959,
+        1.7729599475860596
+      ]
+    },
+    {
+      "BKV": 16,
+      "BQ": 64,
+      "warps": 4,
+      "stages": 2,
+      "geom_time_ms": 1.6764976389439286,
+      "speedup_vs_baseline": 0.6833686003558246,
+      "times": [
+        1.1344000101089478,
+        2.266432046890259,
+        1.8327360153198242
+      ]
+    }
+  ]
+}

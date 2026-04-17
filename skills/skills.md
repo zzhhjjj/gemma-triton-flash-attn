@@ -6,6 +6,7 @@
 |------|-------------------|
 | `2026-04-16_triton-large-headdim.md` | Triton flash attention HEAD_DIM≥256 时的 block size / warp / stage 调优经验 |
 | `2026-04-17_pack-gqa-register-model.md` | Pack-GQA backward kernel block size 调优：BKV 决定 accumulator, BQ 不进 accumulator |
+| `2026-04-17_block-sweep-sm-occupancy.md` | Block-size sweep 必须覆盖最小目标 N，否则 SM occupancy 陷阱导致短 N 回退；解法是 N-gate |
 
 ---
 

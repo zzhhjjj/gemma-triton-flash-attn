@@ -1182,6 +1182,219 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
 
 
 # =====================================================================
+# Split-accumulator pack-GQA backward — experiment 4 (KEPT FOR REFERENCE,
+# NOT ON HOT PATH)
+#
+# Motivation: packed kernel hits 302 register spills at HEAD_DIM=512 because
+# it holds BOTH dk_acc and dv_acc plus 4 matmuls per inner iter (scores,
+# P^T@dO, dO@V^T, dS^T@Q) in a single live state.
+#
+# Split: dV-only needs only Q, K, dO, LSE (no V, no delta) — 2 matmuls and
+# 1 accumulator. dK-only needs Q, K, V, dO, LSE, delta — 3 matmuls and
+# 1 accumulator.
+#
+# Result @ D=512 Gemma4 full causal:
+#   - spills drop 302 → 46 (dV) / 92 (dK)
+#   - BUT total time: +35-36% vs packed (N=4K 9.27 → 12.49ms; N=8K 35.48 → 48.39ms)
+#   - Why: both kernels recompute scores + P. The compute sharing in packed
+#     is worth more than the ~19% spill overhead.
+#
+# Conclusion: kept in source since the analysis is instructive, but
+# `_flash_attn_gqa_bwd_dkv_packed_kernel` remains the hot path.
+# Benchmark: `benchmarks/dkv_split_bench.py`.
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_bwd_dv_only_kernel(
+    Q_ptr, K_ptr, dO_ptr, dV_ptr,
+    LSE_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_dob, stride_doh, stride_don, stride_dod,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    stride_lseb, stride_lseh, stride_lsen,
+    N_Q_HEADS, N_KV_HEADS, SEQ_LEN,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+):
+    # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS)
+    kv_block_idx = tl.program_id(0)
+    bkvh_idx = tl.program_id(1)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
+    dv_base = dV_ptr + b_idx * stride_dvb + kv_h_idx * stride_dvh
+
+    kv_offsets = kv_block_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
+    kv_mask = kv_offsets < SEQ_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+    k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+
+    dv_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
+    if IS_CAUSAL:
+        q_start = (kv_block_idx * BLOCK_KV // BLOCK_Q) * BLOCK_Q
+    else:
+        q_start = 0
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_last = kv_block_idx * BLOCK_KV + BLOCK_KV - 1
+        q_max = kv_last + SLIDE_SIZE - 1
+        q_loop_end = ((q_max // BLOCK_Q) + 1) * BLOCK_Q
+        q_loop_end = tl.minimum(SEQ_LEN, q_loop_end)
+    else:
+        q_loop_end = SEQ_LEN
+
+    for qh_offset in tl.static_range(GQA_RATIO):
+        q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
+        q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
+        do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
+        lse_base = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh
+
+        for q_start_pos in range(q_start, q_loop_end, BLOCK_Q):
+            q_offsets = q_start_pos + tl.arange(0, BLOCK_Q)
+            q_mask_local = q_offsets < SEQ_LEN
+
+            q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+            q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
+            do_ptrs = do_base + q_offsets[:, None] * stride_don + d_range[None, :] * stride_dod
+            do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
+            lse = tl.load(lse_base + q_offsets * stride_lsen, mask=q_mask_local, other=0.0)
+            lse_log2 = lse * LOG2E
+
+            scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
+            if IS_CAUSAL:
+                if SLIDE_SIZE > 0:
+                    valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None] & \
+                            (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE)
+                else:
+                    valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None]
+            else:
+                valid = kv_mask[None, :] & q_mask_local[:, None]
+            scores = tl.where(valid, scores, -float("inf"))
+            p = tl.math.exp2(scores - lse_log2[:, None])
+
+            dv_acc += tl.dot(tl.trans(p.to(do_block.dtype)), do_block).to(tl.float32)
+
+    dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
+    tl.store(dv_ptrs, dv_acc.to(k_block.dtype), mask=kv_mask[:, None])
+
+
+@triton.jit
+def _flash_attn_gqa_bwd_dk_only_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, dK_ptr,
+    LSE_ptr, Delta_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_don, stride_dod,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_lseb, stride_lseh, stride_lsen,
+    stride_db, stride_dh, stride_dn,
+    N_Q_HEADS, N_KV_HEADS, SEQ_LEN,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+):
+    kv_block_idx = tl.program_id(0)
+    bkvh_idx = tl.program_id(1)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
+    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
+    dk_base = dK_ptr + b_idx * stride_dkb + kv_h_idx * stride_dkh
+
+    kv_offsets = kv_block_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
+    kv_mask = kv_offsets < SEQ_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+    k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+    v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+    v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+    dk_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
+    if IS_CAUSAL:
+        q_start = (kv_block_idx * BLOCK_KV // BLOCK_Q) * BLOCK_Q
+    else:
+        q_start = 0
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_last = kv_block_idx * BLOCK_KV + BLOCK_KV - 1
+        q_max = kv_last + SLIDE_SIZE - 1
+        q_loop_end = ((q_max // BLOCK_Q) + 1) * BLOCK_Q
+        q_loop_end = tl.minimum(SEQ_LEN, q_loop_end)
+    else:
+        q_loop_end = SEQ_LEN
+
+    for qh_offset in tl.static_range(GQA_RATIO):
+        q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
+        q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
+        do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
+        lse_base = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh
+        delta_base = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh
+
+        for q_start_pos in range(q_start, q_loop_end, BLOCK_Q):
+            q_offsets = q_start_pos + tl.arange(0, BLOCK_Q)
+            q_mask_local = q_offsets < SEQ_LEN
+
+            q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+            q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
+            do_ptrs = do_base + q_offsets[:, None] * stride_don + d_range[None, :] * stride_dod
+            do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
+            lse = tl.load(lse_base + q_offsets * stride_lsen, mask=q_mask_local, other=0.0)
+            delta = tl.load(delta_base + q_offsets * stride_dn, mask=q_mask_local, other=0.0)
+            lse_log2 = lse * LOG2E
+
+            scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
+            if IS_CAUSAL:
+                if SLIDE_SIZE > 0:
+                    valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None] & \
+                            (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE)
+                else:
+                    valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None]
+            else:
+                valid = kv_mask[None, :] & q_mask_local[:, None]
+            scores = tl.where(valid, scores, -float("inf"))
+            p = tl.math.exp2(scores - lse_log2[:, None])
+
+            dp = tl.dot(do_block, tl.trans(v_block)).to(tl.float32)
+            ds = p * (dp - delta[:, None])
+            ds = tl.where(valid, ds, 0.0)
+
+            dk_acc += tl.dot(tl.trans(ds.to(q_block.dtype)), q_block).to(tl.float32)
+
+    dk_acc *= scale
+
+    dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
+    tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
+
+
+# =====================================================================
 # Autograd Function wrapping forward + backward
 # =====================================================================
 
@@ -1299,8 +1512,19 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
             # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
+            num_stages_dkv = 2
+        elif N >= 8192:
+            # D<512 long N (Gemma-4-E2B sliding N≥8K): sweep (2026-04-17) found
+            # (BKV=64,BQ=128,w=8,s=1) beats (32,64,4,2) by 6% @ N=16K/32K
+            # slide=1024. Big tiles need s=1 to avoid shmem pressure.
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 64, 128, 8
+            num_stages_dkv = 1
         else:
+            # D<512 short N (N<8K): bigger tiles starve SM occupancy on H100
+            # (N=2K × BKV=64 = 32 programs = 24% of 132 SMs → +10% regression).
+            # Stick with the 2026-04-16 config that was tuned at short N.
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
+            num_stages_dkv = 2
         BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))
         BLOCK_Q_DKV = min(BLOCK_Q_DKV, triton.next_power_of_2(N))
         grid_dkv = (triton.cdiv(N, BLOCK_KV_DKV), B * H_KV)
@@ -1324,7 +1548,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
-            num_warps=num_warps_dkv, num_stages=2,
+            num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
         return dq, dk, dv, None, None

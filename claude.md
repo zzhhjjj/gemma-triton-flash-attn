@@ -48,6 +48,29 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-04-17] D=512 full-causal fwd+bwd 详细 profiling + dKV 四路攻坚全失败**：
+  - Profiling (`benchmarks/profile_n8k.py`) @ N=4K/8K/16K 三档稳定 hotspot rank：
+    - **dKV 53-54%** (MFU 6%) > dQ 27-28% (MFU 12%) > fwd 18-19% (MFU 17-19%) > delta <1%
+    - Fwd+Bwd vs SDPA 反常递减：2.64× (N=4K) → 2.49× (N=8K) → 2.41× (N=16K)，dKV 拖的
+  - Register spill 量化 (`benchmarks/dump_kernel_regs.py`) 发现烟枪：
+    - dKV: **302 spills**, 255 regs (cap), 163KB shmem, w=4
+    - dQ: **0 spills**, 189 regs, 196KB shmem, w=8
+    - fwd: 4 spills, 255 regs, 192KB shmem, w=8
+  - 四次针对性实验全失败（`benchmarks/dkv_stages_sweep.py` + `dkv_split_bench.py`）：
+    1. num_stages ∈ {1, 3}: **OOM shmem** (s=1 需要 294KB, s=3 需要 298KB) 
+       — 反直觉，Triton pipeliner 在 s=2 才做 buffer overlapping
+    2. BQ=64→32 sweep: 找到**唯一 0-spill 配置** (BQ=32 w=4 s=1)，但**慢 19%**
+       — pipelining 比消除 spill 值钱
+    3. GQA loop `tl.static_range` → `tl.range`: 慢 20%，spill 几乎没变 (300 vs 302)
+       — unroll 是 performance-positive，代码复制不是 spill 根因
+    4. split 为独立 dV + dK kernel: spills 大减 (302 → 46/92) 但**总时间 +35-36%**
+       — compute sharing (scores+p 共用) 比消 spill 值钱
+  - 结论：`baseline (BQ=64, BKV=16, w=4, s=2, static_range, packed)` 在 5D 空间
+    (block×warps×stages×unroll×structure) **局部最优且已到 Triton 3.x 硬限**
+  - 19% 的 dKV 空间是**算法 live state 硬限**（4 matmul + 2 fp32 accumulator + GQA=8 unroll），
+    对应 claude.md 之前写的"FA3 warp spec / TMA / cluster barrier"同一件事——Triton 语义不给
+  - 代码：留了 `_flash_attn_gqa_bwd_dv_only_kernel` / `_flash_attn_gqa_bwd_dk_only_kernel`
+    on source 作 reference（同 A.1/A.2 风格）；autograd hot path 不变
 - **[2026-04-17] Pack-GQA dKV D=512 block size re-sweep**（full-causal bwd 主攻）:
   - Breakdown profile 显示 dKV 吃 fwd+bwd 62-69%，speedup 随 N 下降 (2.30× → 1.93×)
   - 旧默认 `(BKV=32, BQ=16, w=8)` 沿用 split kernel 的常量，但 pack-GQA register / shmem 模型不同
@@ -104,6 +127,8 @@
 **当前瓶颈**：
 > D=512 Full Attention 已逼近 HBM 带宽上限 (84-90%)；D=256 SWA Fwd+Bwd 现已 N≥4K 打平/超越 SDPA。
 > 剩余不足：N≤2K 仍 0.73-0.88x（窗口覆盖全序列时 SWA ≈ full-causal，Triton 在短 N 输 cuDNN 约 10-25%）。
+>
+> **[2026-04-17 更新] dKV 剩余 19% gap 确认为 Triton 3.x 硬限**：fwd+bwd hotspot 53-54% 来自 dKV，其 302 个 register spill 在 block/warps/stages/unroll/structure 5D 空间内均不可消除（四次实验全败）。对应 FA3 warp specialization + async TMA + cluster barrier——Triton 3.x 不提供。结论：Full Attention 攻坚已到天花板，新增知识见"禁止重复探索"2026-04-17 六行。
 
 **下一步**：
 > 1. ✅ [2026-04-16] 重新跑速度和内存的benchmark，对比 SDPA，生成 FLOPS/MEM vs SEQ LEN 图表
@@ -118,6 +143,7 @@
 >    - USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)：D=512 上关掉避免 register spill
 >    - bwd 所有 kernel 都已切到 exp2 + log2 LSE 中间形式
 > 3. 剩余 gap 到 FA2/FA3：warp specialization + async TMA + cluster barrier（Triton 3.x 不支持）
+>    - [2026-04-17 确认] dKV 层面的 19% gap 已用四次实验定量证实属于这一类（见"禁止重复探索"表 2026-04-17 条目）
 > 2. ✅ [2026-04-16] README 重构：只放成果 + 使用说明，技术细节搬到 `docs/`
 >    - `docs/integration.md`：HF adapter 机制 + 5.5.4 bug 补丁
 >    - `docs/optimization_notes.md`：pack-GQA 成功 + 两条 dead-end
@@ -196,6 +222,13 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 | 2026-04-17 | dQ kernel sweep @ D=512 确认当前默认 (BQ=32, BKV=64, w=8, s=2) 已是 local optimum：Top-5 间距 6-28%，N=16K 验证仍第一 | dQ sweep |
 | 2026-04-17 | dQ kernel warps=8 胜过 4（与 dKV 相反）：dq_acc 只一个 (BQ×D×fp32=64KB)，register 预算宽松，8 warps 更好 hide memory latency | dQ sweep |
 | 2026-04-17 | Split-causal for dKV packed kernel 在 D=512 **dead-end**：两阶段代码复制 shmem 从 232KB 推到 295KB → 全配置 OOM。BQ=16 baseline 13.2ms，即便 split -15% 仍 ~11ms > 当前 9.36ms。BQ=32 baseline 178-305ms 灾难，split 无救。与 forward USE_SPLIT=(HEAD_DIM<512) 结论一致 | split-causal 实验 |
+| 2026-04-17 | D=512 full-causal fwd+bwd hotspot rank 跨 N=4K/8K/16K 全稳定：dKV 53-54% > dQ 27-28% > fwd 18-19% > delta <1%。Fwd+Bwd vs SDPA 随 N 反常递减 (2.64× → 2.41×) 由 dKV 拖 | profile_n8k.py |
+| 2026-04-17 | dKV packed kernel **302 register spills**（255 reg cap）@ D=512 默认 config；dQ 0 spills，fwd 4 spills。dKV MFU 6% 是 dQ 的一半，差距来自算法 live state 硬限（4 matmul + 2 fp32 accumulator + GQA=8 unroll） | dump_kernel_regs.py |
+| 2026-04-17 | dKV num_stages ∈ {1, 3} 在 D=512 默认 block 下 OOM shmem：s=1 需要 294KB，s=3 需要 298KB（vs s=2 的 163KB）。反直觉：Triton pipeliner 在 s=2 做 buffer overlapping，单 stage 反而每 buffer 独立分配。只能 s=2 | dkv_stages_sweep.py |
+| 2026-04-17 | dKV BQ=64→32 sweep：唯一 0-spill 配置 (BQ=32, BKV=16, w=4, s=1) 慢 19% vs baseline。**pipelining 比消除 spill 值钱**。BQ=32 配 s≥2 灾难（Triton 退到 32 regs/thread + 1000+ spills 的 fallback 模式） | dkv_stages_sweep.py |
+| 2026-04-17 | dKV GQA loop `tl.static_range` → `tl.range` (dynamic)：慢 18-20%，spill 300 vs 302 基本不变，shmem 也不变。**unroll 不是 spill 根因**，且 Triton 的 constant folding / pipeline scheduling 在展开码上 performance-positive | dkv_stages_sweep.py |
+| 2026-04-17 | 将 dKV packed 拆成独立 dV-only + dK-only kernel：spills 大减 (302 → 46/92)，但总时间 **+35-36%**（N=4K 9.27→12.49ms, N=8K 35.48→48.39ms）。dV 和 dK 都要重算 scores+p，**compute sharing 比消 spill 更值**。packed kernel 保留为 hot path，两个 split kernel 作 reference 存于源码 | dkv_split_bench.py |
+| 2026-04-17 | **dKV 攻坚四路全失败**：block/warps/stages/unroll/structure 5D 空间穷尽，`packed (BQ=64, BKV=16, w=4, s=2, static_range)` 是局部最优。dKV 剩余 19% gap 是算法 live state 硬限，需 warp specialization + async TMA + cluster barrier（Triton 3.x 不支持，对应 claude.md 早已标注的 FA3 gap） | 4 次实验汇总 |
 
 ---
 
