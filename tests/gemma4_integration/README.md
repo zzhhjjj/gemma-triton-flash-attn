@@ -65,13 +65,17 @@ python test_memory.py
   layer's kernel on cuda:0 regardless of tensor device, silently producing NaN.
 
 - **`test_training.py`** — Real training loop on Gemma-4-E2B: runs N AdamW
-  steps on random-token next-token-prediction, under both SDPA and Triton
-  from the same starting weights, and verifies (a) no NaN/Inf in forward,
-  backward, or gradients, (b) loss decreases monotonically under both, and
-  (c) per-step loss diff stays within 0.05 nats of SDPA. This is the
-  backward-path counterpart to the forward-only `test_gemma4*` tests and
-  proves the Triton kernel's autograd wrapper works end-to-end in a real
-  HF training pipeline. Single H100 is sufficient (~65 GB peak bf16).
+  steps on **WikiText-2** next-token-prediction, under both SDPA and Triton
+  from the same starting weights. Each step sees a different wikitext chunk
+  (realistic multi-batch training), and the test verifies (a) no NaN/Inf in
+  forward, backward, or gradients, (b) step-0 forward matches SDPA within
+  0.05 nats (pure kernel correctness on identical weights), and (c) the
+  10-step loss trajectory stays within 0.5 nats of SDPA (AdamW amplifies
+  any step-0 gradient diff, so some trajectory drift is expected). This is
+  the backward-path counterpart to the forward-only `test_gemma4*` tests
+  and proves the Triton kernel's autograd wrapper works end-to-end in a
+  real HF training pipeline. Single H100 is sufficient (~65 GB peak bf16).
+  Requires `datasets` (listed in the top-level requirements).
 
 - **`test_memory.py`** — Peak-memory benchmark during forward pass at
   increasing seq lengths. Quantifies (a) the point where SDPA starts
