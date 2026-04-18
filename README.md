@@ -22,6 +22,7 @@ same Q/K/V tensors and only the head counts / window size differ.
 | **Gemma-4-E2B E2E forward** | N=16K, BF16 | **4.47× vs SDPA** |
 | **Peak memory** (Gemma-4-E2B fwd) | N=16K, BF16 | **-24%** (22.0 GB → 16.7 GB) |
 | **Max runnable context** (Gemma-4-E2B, 80 GB H100) | — | **32K vs 16K** (SDPA OOMs at 32K) |
+| **FSDP2 training** (Gemma-4-E2B, 8× H100) | 100 steps, BF16 matmul / FP32 master | **PASS** — no NaN, \|Δ\| vs SDPA = 5.3e-03 nats |
 | (bonus) Kernel fwd **D=128** GQA 4:1 | N=32K, FP16 | **1.31× vs SDPA** (421 TFLOPS/s) |
 | (bonus) Kernel fwd **D=256 SWA** slide=1024 | N=32K, FP16 | **18.3× vs SDPA** |
 
@@ -109,6 +110,66 @@ N=16K SDPA starts materialising attention scratch and Triton saves 5.3 GB;
 at N=32K SDPA runs out of memory entirely while Triton still fits in
 33 GB above the model weights.
 
+## End-to-end training (FSDP2, 8× H100)
+
+The kernel's backward pass works under real mixed-precision training
+(fp32 master weights / fp32 AdamW states / bf16 matmul) sharded across
+8 H100s with FSDP2 per-layer `fully_shard()`:
+
+![FSDP2 training loss, Gemma-4-E2B on WikiText-2](benchmarks/training_loss_fsdp2.png)
+
+**Step-0 forward correctness**: SDPA vs Triton on identical weights and
+inputs gives **|Δ| = 5.3e-03 nats** — well within bf16 rounding tolerance.
+**100 training steps** on WikiText-2 complete with no NaN, loss stays
+bounded around the initial 2.24-nat level (per-step variance is
+chunk-difficulty noise — each step is a different WikiText chunk, not
+the same batch re-trained). The EMA curve shows no divergence.
+
+The precision recipe on each rank:
+
+| | dtype | storage |
+|---|---|---|
+| Master weights | fp32 | sharded across 8 GPUs |
+| AdamW states (`exp_avg`, `exp_avg_sq`) | fp32 | sharded |
+| Forward / backward matmul | bf16 | FSDP2 casts on all-gather |
+| Gradient reduce-scatter | bf16 | `reduce_dtype` |
+| Optimizer update | fp32 | (params upcast on unshard) |
+
+### Gemma-4 + FSDP2 per-layer sharding: one gotcha
+
+FSDP2's per-module `pre_forward` hook runs `tree_flatten`/`tree_unflatten`
+on kwargs to register a post-backward hook on grad-requiring tensors.
+`dict` is a pytree container, so unflatten rebuilds it as a *new* empty
+dict — Gemma-4's cross-layer `shared_kv_states` loses identity at every
+layer boundary, and layers past the KV-sharing point raise `KeyError`.
+
+One-line fix: call `patch_gemma4_shared_kv_states_for_fsdp2()` at import
+time, which swaps the dict for a pytree-opaque holder whose identity
+survives flatten/unflatten. Forward is bit-identical pre/post patch.
+
+```python
+from gemma_triton_flash_attn import (
+    register_triton_attention,
+    patch_gemma4_shared_kv_states_for_fsdp2,
+)
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+register_triton_attention()
+patch_gemma4_shared_kv_states_for_fsdp2()              # required for per-layer FSDP2
+model = AutoModelForCausalLM.from_pretrained("google/gemma-4-E2B",
+                                             dtype="float32")
+model.config._attn_implementation = "triton_gqa"
+model.config.text_config._attn_implementation = "triton_gqa"
+
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16,
+                          cast_forward_inputs=False)
+for layer in model.model.language_model.layers:
+    fully_shard(layer, mp_policy=mp)
+fully_shard(model, mp_policy=mp)
+```
+
+Full runnable test: [`tests/gemma4_integration/test_training_fsdp2.py`](tests/gemma4_integration/test_training_fsdp2.py).
+
 ## Quickstart: swap attention in 3 lines
 
 ```python
@@ -175,6 +236,13 @@ python tests/gemma4_integration/test_adapter.py
 # 2) Real Gemma-4-E2B end-to-end — downloads 5 GB on first run
 export HF_TOKEN="hf_..."                  # Gemma is gated on HF
 python tests/gemma4_integration/test_gemma4.py --seq-len 1024
+
+# 3) Single-GPU training test — 10 AdamW steps on WikiText-2
+python tests/gemma4_integration/test_training.py --steps 10
+
+# 4) FSDP2 mixed-precision training — 8 GPUs, per-layer sharding
+torchrun --standalone --nproc-per-node=8 \
+    tests/gemma4_integration/test_training_fsdp2.py --steps 100
 ```
 
 Full test matrix and expected outputs: [`docs/tests.md`](docs/tests.md).
@@ -204,6 +272,8 @@ Full test matrix and expected outputs: [`docs/tests.md`](docs/tests.md).
 export HF_TOKEN="hf_..."
 python benchmarks/run_final_benchmark.py       # 30-min run, produces results.json + 3 PNGs
 python benchmarks/replot.py                    # regenerate plots from cached data
+python benchmarks/plot_training_loss.py        # regenerate training-loss PNG from cached JSON
 ```
 
-Raw numbers live in [`benchmarks/results.json`](benchmarks/results.json).
+Raw numbers live in [`benchmarks/results.json`](benchmarks/results.json) and
+[`benchmarks/training_loss_fsdp2.json`](benchmarks/training_loss_fsdp2.json).
