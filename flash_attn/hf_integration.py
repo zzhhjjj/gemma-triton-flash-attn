@@ -97,3 +97,133 @@ def patch_transformers_5_5_4_flash_attn_key() -> None:
     """
     from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
     PACKAGE_DISTRIBUTION_MAPPING.setdefault("flash_attn", ["flash-attn"])
+
+
+class _SharedKVStatesHolder:
+    """Opaque container for Gemma-4 cross-layer KV sharing under FSDP2.
+
+    FSDP2's per-module `pre_forward` hook runs `tree_flatten` / `tree_unflatten`
+    on kwargs to register a backward hook on grad-requiring tensors. `dict` is a
+    registered pytree container, so unflatten rebuilds a *new* empty dict — the
+    writes from earlier layers vanish, and later `is_kv_shared_layer` reads fail
+    with `KeyError`. An object not registered with pytree is treated as a leaf,
+    so its identity (and contents) survive the flatten/unflatten round-trip.
+    Subscript ops `[idx]` are routed to an internal dict to match the original
+    `shared_kv_states: dict[int, tuple[K, V]]` contract used by Gemma-4 code.
+    """
+    __slots__ = ("_d",)
+
+    def __init__(self):
+        self._d = {}
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+    def __setitem__(self, k, v):
+        self._d[k] = v
+
+    def __contains__(self, k):
+        return k in self._d
+
+
+def patch_gemma4_shared_kv_states_for_fsdp2() -> None:
+    """Replace `Gemma4TextModel.forward`'s `shared_kv_states = {}` with an
+    opaque holder that survives FSDP2's pytree flatten/unflatten.
+
+    Required when wrapping each `Gemma4TextDecoderLayer` with `fully_shard()`
+    for per-layer parameter sharding (which gives proper all-gather/compute
+    overlap). Without this, the dict identity is lost across FSDP2 boundaries
+    and layers past the KV-sharing point raise `KeyError` on lookup.
+
+    No-op for single-boundary sharding (no per-layer wrap), but still safe to
+    call. Idempotent (marks the patched method with an attribute).
+    """
+    from transformers.models.gemma4 import modeling_gemma4 as mg
+
+    if getattr(mg.Gemma4TextModel.forward, "_patched_for_fsdp2", False):
+        return
+
+    orig_forward = mg.Gemma4TextModel.forward
+
+    # Re-implemented body of Gemma4TextModel.forward with exactly one change:
+    # `shared_kv_states = _SharedKVStatesHolder()` instead of `{}`. Done this
+    # way (full body copy) because the dict is constructed inline with no hook
+    # point we could intercept from outside. Drops the original's
+    # `@merge_with_config_defaults @capture_outputs @auto_docstring` decorators
+    # which only add ancillary features (config defaults, intermediate-output
+    # capture, docstrings) — none are needed for training.
+    from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.cache_utils import DynamicCache
+    from transformers.masking_utils import (
+        create_causal_mask,
+        create_sliding_window_causal_mask,
+    )
+
+    def _forward_impl(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        per_layer_inputs=None,
+        use_cache=None,
+        **kwargs,
+    ):
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if input_ids is not None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        if self.hidden_size_per_layer_input:
+            if per_layer_inputs is None:
+                per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
+            per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+        if position_ids is None:
+            import torch
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+        hidden_states = inputs_embeds
+        position_embeddings = {}
+        for layer_type in self.unique_layer_types:
+            position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
+
+        # THE FIX: use pytree-opaque holder so FSDP2's per-layer flatten/unflatten
+        # preserves the dict-like state across decoder-layer boundaries.
+        shared_kv_states = _SharedKVStatesHolder()
+
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            per_layer_input = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            hidden_states = decoder_layer(
+                hidden_states,
+                per_layer_input,
+                shared_kv_states=shared_kv_states,
+                position_embeddings=position_embeddings[self.config.layer_types[i]],
+                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+    _forward_impl._patched_for_fsdp2 = True
+    _forward_impl._original_forward = orig_forward
+    mg.Gemma4TextModel.forward = _forward_impl
