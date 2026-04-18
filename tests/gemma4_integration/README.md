@@ -1,7 +1,11 @@
-# Gemma-4-E2B Integration Test
+# Gemma-4 Integration Tests
 
-End-to-end test swapping the attention implementation in the real
-`google/gemma-4-E2B` model (5.1B params, 35 layers) with our Triton kernel.
+End-to-end tests swapping the attention implementation in real Gemma-4 models
+with our Triton kernel:
+
+- **`google/gemma-4-E2B`** (5.1B dense, 35 layers) — `test_gemma4.py`
+- **`google/gemma-4-26B-A4B`** (26B MoE, 30 layers, 128 experts, top-k=8) —
+  `test_gemma4_moe.py`. Requires multi-GPU (shards via `device_map="auto"`).
 
 ## Setup
 
@@ -28,6 +32,9 @@ python test_gemma4.py --skip-perf
 # Real Gemma-4-E2B — correctness + throughput
 python test_gemma4.py --seq-len 1024
 
+# Real Gemma-4-26B-A4B MoE — shards across all visible GPUs
+python test_gemma4_moe.py --seq-len 1024
+
 # Memory benchmark — SDPA vs Triton peak memory, max context length
 python test_memory.py
 ```
@@ -45,6 +52,14 @@ python test_memory.py
   (5.1B params, 35 layers: 7 full + 28 sliding), swaps attention to the Triton
   kernel via the registry, compares logits vs SDPA, benchmarks throughput.
   Confirms the integration works on a real production-sized model.
+
+- **`test_gemma4_moe.py`** — MoE version: loads `google/gemma-4-26B-A4B`
+  (26B params, 30 layers: 24 sliding + 6 full, 128 experts, top-k=8), shards
+  across all visible GPUs via `device_map="auto"`, and compares last-token
+  logits vs SDPA. Full-sequence logits (1×N×262K) won't fit next to the 52 GB
+  weights, so only the last-token row is compared. Requires the multi-GPU
+  device-context fix in `hf_integration.py` — Triton otherwise launches every
+  layer's kernel on cuda:0 regardless of tensor device, silently producing NaN.
 
 - **`test_memory.py`** — Peak-memory benchmark during forward pass at
   increasing seq lengths. Quantifies (a) the point where SDPA starts

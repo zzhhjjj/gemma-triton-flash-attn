@@ -65,9 +65,13 @@ def triton_gqa_attention(
     slide = int(sliding_window) if sliding_window else 0
     is_causal = getattr(module, "is_causal", True)
 
-    # (B, H_Q, N, D) → (B, H_Q, N, D), then transpose to match HF's post-processing
-    # which does `attn_output.reshape(B, N, -1)` expecting (B, N, H_Q, D).
-    out = flash_attn_gqa_train(query, key, value, causal=is_causal, slide_size=slide)
+    # Multi-GPU (device_map="auto") safety: Triton launches kernels on
+    # torch.cuda.current_device(), NOT on the tensor's device. accelerate's
+    # layer dispatch moves tensors across GPUs but doesn't switch the current
+    # device, so a layer on cuda:N would launch its Triton kernel on cuda:0's
+    # stream — silently producing NaN output. Wrap the launch in a device ctx.
+    with torch.cuda.device(query.device):
+        out = flash_attn_gqa_train(query, key, value, causal=is_causal, slide_size=slide)
     out = out.transpose(1, 2).contiguous()
     return out, None  # (attn_output, attn_weights)
 
