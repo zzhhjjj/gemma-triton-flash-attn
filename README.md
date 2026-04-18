@@ -17,6 +17,8 @@ same Q/K/V tensors and only the head counts / window size differ.
 |-----------|--------|-----------------------|
 | **Kernel fwd** (full causal, D=512, GQA 8:1) | N=32K, FP16 | **2.18× vs SDPA** |
 | **Kernel fwd+bwd** (full causal, D=512, GQA 8:1) | N=2K, FP16 | **2.94× vs SDPA** (≥2.43× across all N) |
+| **MoE kernel fwd+bwd** (D=512, GQA 8:1) | N=2K, FP16 | **3.45× vs SDPA** |
+| **MoE kernel fwd** (D=256 SWA, slide=1024) | N=16K, FP16 | **9.23× vs SDPA** |
 | **Gemma-4-E2B E2E forward** | N=16K, BF16 | **4.47× vs SDPA** |
 | **Peak memory** (Gemma-4-E2B fwd) | N=16K, BF16 | **-24%** (22.0 GB → 16.7 GB) |
 | **Max runnable context** (Gemma-4-E2B, 80 GB H100) | — | **32K vs 16K** (SDPA OOMs at 32K) |
@@ -52,6 +54,51 @@ worth only a few percent. See [`docs/optimization_notes.md`](docs/optimization_n
 Short N is dominated by linear projections (35 layers × 4 projs each);
 attention becomes the bottleneck once N ≥ 2K, where the Triton kernel
 widens the gap.
+
+### MoE attention (Gemma-4-26B-A4B shapes)
+
+The MoE router is upstream of attention, so the kernel sees standard Q/K/V
+tensors — only the head counts and window size change from E2B. Block sizes
+select on `HEAD_DIM` alone, so the same tuned configs apply. Kernel-level
+numbers on the two MoE attention shapes, H100 FP16:
+
+**MoE full causal** — `D=512, H_Q=16, H_KV=2` (GQA 8:1, 6 layers of 30):
+
+| N | Triton fwd | SDPA fwd | fwd sp | Triton F+B | SDPA F+B | F+B sp |
+|---|-----------|----------|--------|------------|----------|--------|
+|  1024 |   0.25 ms |   0.25 ms | 1.02× |   1.29 ms |    3.48 ms | 2.69× |
+|  2048 |   0.64 ms |   0.79 ms | 1.24× |   2.64 ms |    9.12 ms | **3.45×** |
+|  4096 |   1.85 ms |   2.67 ms | 1.44× |   9.15 ms |   26.48 ms | 2.89× |
+|  8192 |   6.46 ms |  10.27 ms | 1.59× |  33.94 ms |   89.29 ms | 2.63× |
+| 16384 |  24.21 ms |  43.51 ms | 1.80× | 132.13 ms |  322.82 ms | 2.44× |
+| 32768 |  98.52 ms | 202.73 ms | **2.06×** | 525.62 ms | 1277.73 ms | 2.43× |
+
+Same story as E2B full causal: SDPA has no fast-path for `D=512`, so Triton
+fwd scales from 1.02× at N=1K to 2.06× at N=32K. Fwd+bwd already hits
+**3.45× at N=2K** and stays ≥2.43× everywhere — the backward softmax/rescale
+work is where `exp2` earns the most.
+
+**MoE sliding** — `D=256, H_Q=16, H_KV=8, slide=1024` (GQA 2:1, 24 layers of 30):
+
+| N | Triton fwd | SDPA fwd | fwd sp | Triton F+B | SDPA F+B | F+B sp |
+|---|-----------|----------|--------|------------|----------|--------|
+|  1024 |  0.10 ms |  0.10 ms | 0.99× |   0.40 ms |   0.36 ms | 0.89× |
+|  2048 |  0.18 ms |  0.15 ms | 0.87× |   0.63 ms |   0.58 ms | 0.92× |
+|  4096 |  0.27 ms |  0.63 ms | 2.31× |   1.07 ms |   2.41 ms | 2.25× |
+|  8192 |  0.47 ms |  1.08 ms | 2.28× |   2.02 ms |   5.19 ms | 2.57× |
+| 16384 |  0.85 ms |  7.89 ms | **9.23×** |   4.00 ms |  30.04 ms | 7.51× |
+| 32768 |  1.89 ms | 15.16 ms | 8.02× |   8.41 ms |  79.53 ms | **9.46×** |
+
+At N ≤ slide (1024 / 2048) SDPA still routes to FlashAttention-3 (the window
+covers the whole sequence, so it degenerates to full causal) and matches us.
+Once N > slide SDPA falls back and the gap snaps open — 9.23× at N=16K fwd,
+9.46× at N=32K fwd+bwd.
+
+Raw numbers: [`benchmarks/moe_attn_sweep.json`](benchmarks/moe_attn_sweep.json).
+Note: MoE kernel speedups ≠ MoE E2E speedups — end-to-end, attention is
+only ~3% of CUDA time in the Triton path at N≤8K, so E2E gains max out
+around 2.3× (dominated by RoPE / reshape / MoE expert matmul). See
+[`docs/optimization_notes.md`](docs/optimization_notes.md).
 
 ### Memory
 
