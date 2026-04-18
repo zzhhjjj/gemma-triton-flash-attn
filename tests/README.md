@@ -9,6 +9,7 @@ tests/
 │   ├── test_adapter.py          ← HF attention registry + adapter unit tests (24 cases)
 │   ├── test_gemma4.py           ← real Gemma-4-E2B E2E forward + throughput
 │   ├── test_gemma4_moe.py       ← real Gemma-4-26B-A4B (MoE) E2E forward + throughput
+│   ├── test_training.py         ← real Gemma-4-E2B E2E training (fwd+bwd+optim steps)
 │   └── test_memory.py           ← Peak memory SDPA vs Triton on real model
 └── legacy/                      ← experiments that didn't pan out, kept for reference
     ├── test_fused_backward.py   ← A.2 atomic-fused dQ+dKV (net-negative, unused)
@@ -37,6 +38,7 @@ source /opt/tiger/flash_gemma/bin/activate
 python tests/gemma4_integration/test_adapter.py       # 24/24 cases must PASS
 python tests/gemma4_integration/test_gemma4.py        # cos sim > 0.999, top-1 100%
 python tests/gemma4_integration/test_gemma4_moe.py    # MoE 26B, multi-GPU, cos sim > 0.999
+python tests/gemma4_integration/test_training.py      # E2B fwd+bwd+AdamW, loss↓, no NaN
 python tests/gemma4_integration/test_memory.py        # no regression in peak memory
 ```
 

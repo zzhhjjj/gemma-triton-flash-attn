@@ -35,6 +35,9 @@ python test_gemma4.py --seq-len 1024
 # Real Gemma-4-26B-A4B MoE — shards across all visible GPUs
 python test_gemma4_moe.py --seq-len 1024
 
+# Real training — Gemma-4-E2B fwd+bwd+AdamW, verify loss drops & no NaN
+python test_training.py --steps 5
+
 # Memory benchmark — SDPA vs Triton peak memory, max context length
 python test_memory.py
 ```
@@ -60,6 +63,15 @@ python test_memory.py
   weights, so only the last-token row is compared. Requires the multi-GPU
   device-context fix in `hf_integration.py` — Triton otherwise launches every
   layer's kernel on cuda:0 regardless of tensor device, silently producing NaN.
+
+- **`test_training.py`** — Real training loop on Gemma-4-E2B: runs N AdamW
+  steps on random-token next-token-prediction, under both SDPA and Triton
+  from the same starting weights, and verifies (a) no NaN/Inf in forward,
+  backward, or gradients, (b) loss decreases monotonically under both, and
+  (c) per-step loss diff stays within 0.05 nats of SDPA. This is the
+  backward-path counterpart to the forward-only `test_gemma4*` tests and
+  proves the Triton kernel's autograd wrapper works end-to-end in a real
+  HF training pipeline. Single H100 is sufficient (~65 GB peak bf16).
 
 - **`test_memory.py`** — Peak-memory benchmark during forward pass at
   increasing seq lengths. Quantifies (a) the point where SDPA starts
