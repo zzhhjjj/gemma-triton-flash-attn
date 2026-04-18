@@ -7,11 +7,13 @@ across every combination we care about:
   - **GQA ratio**:         1:1 (MHA), 2:1, 4:1, 8:1
   - **HEAD_DIM**:          256 (Gemma4 sliding) and 512 (Gemma4 full)
   - **Sequence length**:   short (N≤slide) and long (N>slide)
+  - **Gemma-4 variants**:  E2B dense (H_Q=32, slide=512) AND
+                           26B-A4B MoE (H_Q=16, slide=1024)
 
 Compares output against a manual SDPA reference that encodes the same mask.
 This is what guarantees that swapping `config._attn_implementation` to
 `"triton_gqa"` preserves semantics for both **full** and **sliding** layers
-in a model like Gemma-4-E2B (29 sliding + 6 full).
+in Gemma-4-E2B (29 sliding + 6 full) AND Gemma-4-26B-A4B (24 sliding + 6 full).
 
 Run:
     source /opt/tiger/flash_gemma/bin/activate
@@ -153,6 +155,24 @@ def main():
                       B=2, H_Q=8, H_KV=1, N=1024, D=256, slide_size=0))
     cases.append(Case("SWA    D=256 8:1   N=2048 B=2 slide=512",
                       B=2, H_Q=8, H_KV=1, N=2048, D=256, slide_size=512))
+
+    # --- Gemma-4-26B-A4B (MoE) exact attention shapes ---
+    # Sliding layers (24/30): D=256, H_Q=16, H_KV=8 (GQA 2:1), window=1024.
+    # Global  layers ( 6/30): D=512, H_Q=16, H_KV=2 (GQA 8:1), full causal.
+    # MoE routing is upstream of attention — kernel sees the same Q/K/V tensors,
+    # only the head counts and window size differ from E2B dense.
+    moe_slide = 1024
+    N_moe_short, N_moe_long = 1024, 2048  # exercise N<=slide and N>slide at slide=1024
+    # Sliding: full window coverage (N<=slide — should match full causal)
+    cases.append(Case(f"MoE SWA   D=256 16:8  N={N_moe_short} slide={moe_slide}",
+                      B=1, H_Q=16, H_KV=8, N=N_moe_short, D=256, slide_size=moe_slide))
+    # Sliding: window truncation (N>slide — genuine SWA behavior)
+    cases.append(Case(f"MoE SWA   D=256 16:8  N={N_moe_long} slide={moe_slide}",
+                      B=1, H_Q=16, H_KV=8, N=N_moe_long, D=256, slide_size=moe_slide))
+    # Global: full causal
+    for N in (N_short, N_long):
+        cases.append(Case(f"MoE causal D=512 16:2  N={N}",
+                          B=1, H_Q=16, H_KV=2, N=N, D=512, slide_size=0))
 
     # Run all cases.
     print(f"{'Case':<52} {'cos sim':>10} {'rel err':>10}  status")

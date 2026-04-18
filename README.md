@@ -7,6 +7,9 @@ subclassing, no model surgery.
 Optimised for **Gemma4-style models** (GQA with alternating **full causal**
 `HEAD_DIM=512` and **sliding window** `HEAD_DIM=256` layers), where SDPA's
 cuDNN / FlashAttention-3 paths either miss the config or lack SWA support.
+Covers both **Gemma-4-E2B (dense)** and **Gemma-4-26B-A4B (MoE)** attention
+shapes — the MoE router is upstream of attention, so the kernel sees the
+same Q/K/V tensors and only the head counts / window size differ.
 
 ## Results at a glance (H100, single GPU)
 
@@ -88,12 +91,16 @@ PyTorch SDPA (cuDNN / FlashAttention-3) is heavily optimised for standard
 `HEAD_DIM` values (64, 128, 256). Gemma4's two attention variants fall
 outside the fast path:
 
-| Config | HEAD_DIM | H_Q / H_KV | GQA ratio | SDPA status |
-|--------|----------|------------|-----------|-------------|
-| Full causal (Gemma4 global) | **512** | 32 / 4 | 8:1 | generic fallback, slow |
-| Sliding (Gemma4 local) | 256 | 32 / 16 | 2:1 | fast at short N, **no SWA support** |
+| Variant | Layer | HEAD_DIM | H_Q / H_KV | GQA ratio | Window | SDPA status |
+|---------|-------|----------|------------|-----------|--------|-------------|
+| E2B dense | global  | **512** | 32 / 4 | 8:1 | — | generic fallback, slow |
+| E2B dense | sliding | 256 | 32 / 16 | 2:1 | 512 | fast at short N, **no SWA support** |
+| 26B-A4B MoE | global  | **512** | 16 / 2 | 8:1 | — | generic fallback, slow |
+| 26B-A4B MoE | sliding | 256 | 16 / 8 | 2:1 | 1024 | fast at short N, **no SWA support** |
 
-For models that alternate these (Gemma4, MoE hybrids), this kernel is
+Kernel block sizes select on `HEAD_DIM` only (head counts and `slide_size`
+are runtime params), so the same tuned configs apply across E2B and MoE.
+For models that alternate these (Gemma4 dense, Gemma4 MoE), this kernel is
 typically 1.3×–4.5× faster end-to-end on H100.
 
 ## Installation
