@@ -6,7 +6,7 @@ loads everything in bf16):
   - Master weights:       fp32, sharded across 8 GPUs by FSDP2
   - Optimizer states:     fp32 (AdamW exp_avg, exp_avg_sq), sharded
   - Forward / backward:   bf16 matmul (FSDP2 casts params on access)
-  - Gradient reduction:   bf16 (reduce_dtype)
+  - Gradient reduction:   fp32 (reduce_dtype) — avoids bf16 sum error at 8+ ranks
   - Optimizer update:     fp32 (params upcast on unshard)
 
 Per-GPU memory (Gemma-4-E2B, 5.1B params, fp32 master):
@@ -103,6 +103,11 @@ def main():
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--attn", default="triton_gqa",
+                    choices=["triton_gqa", "sdpa"],
+                    help="attention implementation used during training")
+    ap.add_argument("--save-losses", default=None,
+                    help="rank-0 writes per-step losses to this JSON path")
     args = ap.parse_args()
 
     # Initialize distributed — expects torchrun env vars.
@@ -126,13 +131,18 @@ def main():
     ).to(device)
     tok = AutoTokenizer.from_pretrained(args.model)
 
-    # Mixed-precision policy: bf16 matmul, fp32 master.
+    # Mixed-precision policy: bf16 matmul, fp32 master, fp32 gradient reduce.
+    #
+    # `reduce_dtype=fp32` keeps gradient reduce-scatter in fp32 to avoid
+    # bf16-accumulation error across ranks — small per-param grads can lose
+    # most of their precision when summed in bf16 at 8+ ranks. Cheap: comm
+    # volume doubles but we're not bandwidth-bound on NVLink within a node.
     #
     # `cast_forward_inputs=False` keeps FSDP2 from casting forward inputs at
     # each boundary. We get bf16 matmul via the outer autocast in fwd_loss.
     mp = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
         cast_forward_inputs=False,
     )
     # Per-layer sharding: wrap each decoder layer individually so FSDP2 can
@@ -170,11 +180,11 @@ def main():
     rp(f"\n[step-0 fwd correctness] SDPA={l_sdpa:.6f}  Triton={l_tri:.6f}  "
        f"|Δ|={abs(l_sdpa - l_tri):.4e}")
 
-    # --- Training: Triton attention + mixed precision via FSDP2 ---
-    set_impl(model, "triton_gqa")
+    # --- Training: `--attn` attention + mixed precision via FSDP2 ---
+    set_impl(model, args.attn)
     model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    rp(f"\n[train] Triton attention, FSDP2 mixed precision, AdamW lr={args.lr}")
+    rp(f"\n[train] attn={args.attn}, FSDP2 mixed precision, AdamW lr={args.lr}")
 
     losses = []
     any_nan = False
@@ -229,6 +239,24 @@ def main():
           and len(losses) == len(batches)
           and abs(l_sdpa - l_tri) < 0.05)
     rp(f"{'PASS' if ok else 'FAIL'}")
+
+    if args.save_losses and is_rank0():
+        import json
+        payload = {
+            "attn": args.attn,
+            "model": args.model,
+            "seq_len": args.seq_len,
+            "batch_per_rank": args.batch,
+            "world_size": world_size,
+            "effective_batch": args.batch * world_size,
+            "lr": args.lr,
+            "step0_sdpa_loss": l_sdpa,
+            "step0_triton_loss": l_tri,
+            "losses": [{"step": i, "loss": l} for i, l in enumerate(losses)],
+        }
+        with open(args.save_losses, "w") as f:
+            json.dump(payload, f, indent=2)
+        rp(f"[save] losses → {args.save_losses}")
 
     dist.barrier()
     dist.destroy_process_group()

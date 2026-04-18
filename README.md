@@ -22,7 +22,7 @@ same Q/K/V tensors and only the head counts / window size differ.
 | **Gemma-4-E2B E2E forward** | N=16K, BF16 | **4.47× vs SDPA** |
 | **Peak memory** (Gemma-4-E2B fwd) | N=16K, BF16 | **-24%** (22.0 GB → 16.7 GB) |
 | **Max runnable context** (Gemma-4-E2B, 80 GB H100) | — | **32K vs 16K** (SDPA OOMs at 32K) |
-| **FSDP2 training** (Gemma-4-E2B, 8× H100) | 100 steps, BF16 matmul / FP32 master | **PASS** — no NaN, \|Δ\| vs SDPA = 5.3e-03 nats |
+| **FSDP2 training vs SDPA** (Gemma-4-E2B, 8× H100) | 100 steps, fp32 master + bf16 matmul + fp32 reduce | **mean last-50 loss within 0.004 nats** of SDPA |
 | (bonus) Kernel fwd **D=128** GQA 4:1 | N=32K, FP16 | **1.31× vs SDPA** (421 TFLOPS/s) |
 | (bonus) Kernel fwd **D=256 SWA** slide=1024 | N=32K, FP16 | **18.3× vs SDPA** |
 
@@ -113,17 +113,22 @@ at N=32K SDPA runs out of memory entirely while Triton still fits in
 ## End-to-end training (FSDP2, 8× H100)
 
 The kernel's backward pass works under real mixed-precision training
-(fp32 master weights / fp32 AdamW states / bf16 matmul) sharded across
-8 H100s with FSDP2 per-layer `fully_shard()`:
+(fp32 master weights / fp32 AdamW states / bf16 matmul / fp32 grad
+reduce) sharded across 8 H100s with FSDP2 per-layer `fully_shard()`.
+Same model, same data, same optimizer init — only the attention kernel
+differs:
 
-![FSDP2 training loss, Gemma-4-E2B on WikiText-2](benchmarks/training_loss_fsdp2.png)
+![FSDP2 training loss, SDPA vs Triton](benchmarks/training_loss_fsdp2.png)
 
-**Step-0 forward correctness**: SDPA vs Triton on identical weights and
-inputs gives **|Δ| = 5.3e-03 nats** — well within bf16 rounding tolerance.
-**100 training steps** on WikiText-2 complete with no NaN, loss stays
-bounded around the initial 2.24-nat level (per-step variance is
-chunk-difficulty noise — each step is a different WikiText chunk, not
-the same batch re-trained). The EMA curve shows no divergence.
+**Step-0 forward correctness**: on identical weights and inputs, Triton
+and SDPA agree to **|Δ| = 5.3e-03 nats** — within bf16 rounding tolerance.
+
+**100 training steps** on WikiText-2: the two loss trajectories track
+tightly throughout, finishing within **0.004 nats** of each other on the
+last-50-step mean (SDPA = 2.396, Triton = 2.391). Per-step |SDPA − Triton|
+averages 0.021 nats (max 0.156), with no divergence across 100 AdamW
+updates. Per-step noise is chunk-difficulty variation (each step is a
+different WikiText chunk), not training instability.
 
 The precision recipe on each rank:
 
@@ -131,9 +136,9 @@ The precision recipe on each rank:
 |---|---|---|
 | Master weights | fp32 | sharded across 8 GPUs |
 | AdamW states (`exp_avg`, `exp_avg_sq`) | fp32 | sharded |
-| Forward / backward matmul | bf16 | FSDP2 casts on all-gather |
-| Gradient reduce-scatter | bf16 | `reduce_dtype` |
-| Optimizer update | fp32 | (params upcast on unshard) |
+| Forward / backward matmul | bf16 | FSDP2 casts params on all-gather |
+| Gradient reduce-scatter | **fp32** | `reduce_dtype` — avoids bf16 sum error at 8+ ranks |
+| Optimizer update | fp32 | params upcast on unshard |
 
 ### Gemma-4 + FSDP2 per-layer sharding: one gotcha
 
@@ -161,7 +166,7 @@ model = AutoModelForCausalLM.from_pretrained("google/gemma-4-E2B",
 model.config._attn_implementation = "triton_gqa"
 model.config.text_config._attn_implementation = "triton_gqa"
 
-mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16,
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
                           cast_forward_inputs=False)
 for layer in model.model.language_model.layers:
     fully_shard(layer, mp_policy=mp)
