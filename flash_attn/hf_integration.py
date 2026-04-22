@@ -22,9 +22,89 @@ changes required.
 """
 from __future__ import annotations
 
+import contextvars
+from typing import NamedTuple
+
 import torch
 
 from .attention import flash_attn_gqa_train
+
+
+# =====================================================================
+# Image-bidirectional-mask plumbing for Gemma-4 multimodal training
+#
+# Gemma-4 (when `text_config.use_bidirectional_attention == "vision"`,
+# currently only the 26B-A4B MoE) builds an OR-mask on top of the standard
+# sliding causal mask: tokens within the same vision span attend to each
+# other bidirectionally (`q_group == k_group & q_group >= 0`). See
+# `transformers.models.gemma4.modeling_gemma4.create_causal_mask_mapping`
+# (it sets `sliding_mask_kwargs["or_mask_function"]` only — full-attention
+# layers stay pure-causal).
+#
+# The mask reaches our adapter as a `BlockMask` / 4D bool tensor with the
+# group info baked in — there's no public API to extract it back. We solve
+# this by patching `Gemma4Model.forward` to compute the group state once
+# per forward and stash it in a ContextVar that the adapter reads.
+#
+# Adapter contract: when this ContextVar is set AND the layer is a sliding
+# layer (sliding_window != None), pass the group tensors to the kernel.
+# Full-attention layers ignore them (matches upstream).
+# =====================================================================
+
+class _ImageGroupState(NamedTuple):
+    group_ids: torch.Tensor      # (B, N) int32; -1 = non-vision token
+    group_lo: torch.Tensor       # (B, N) int32; first KV idx in same group (or self)
+    group_hi_excl: torch.Tensor  # (B, N) int32; last KV idx+1 in same group (or self+1)
+
+
+_image_group_state: contextvars.ContextVar[_ImageGroupState | None] = (
+    contextvars.ContextVar("_triton_gqa_image_group_state", default=None)
+)
+
+
+def _compute_image_group_state(mm_token_type_ids: torch.Tensor) -> _ImageGroupState:
+    """Replicate Gemma-4's `vision_group_ids` derivation, plus precompute the
+    per-token bidirectional reach (`group_lo`, `group_hi_excl`) the kernel
+    needs to extend its loop bounds.
+
+    Source for the group derivation: `modeling_gemma4.py` lines 2052-2057
+    (must stay in sync with upstream).
+    """
+    # mm_token_type_ids: (B, N) int. vision tokens have type_id 1 or 2.
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
+    is_prev_vision[..., 0] = False
+    new_vision_starts = is_vision & ~is_prev_vision
+    vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+    vision_group_ids = torch.where(is_vision, vision_group_ids, -1)
+
+    B, N = vision_group_ids.shape
+    device = vision_group_ids.device
+    idx = torch.arange(N, device=device, dtype=torch.int32)
+    idx_b = idx.unsqueeze(0).expand(B, -1)
+
+    # Bucket = group_id + 1 so non-vision (-1) maps to bucket 0 (sentinel,
+    # never read back). Vision groups occupy buckets 1..G_max.
+    buckets = (vision_group_ids + 1).long()
+    G_buckets = int(buckets.max().item()) + 1
+
+    group_min = torch.full((B, G_buckets), N, dtype=torch.int32, device=device)
+    group_max = torch.full((B, G_buckets), -1, dtype=torch.int32, device=device)
+    group_min.scatter_reduce_(1, buckets, idx_b, reduce="amin", include_self=True)
+    group_max.scatter_reduce_(1, buckets, idx_b, reduce="amax", include_self=True)
+
+    gathered_min = group_min.gather(1, buckets)
+    gathered_max = group_max.gather(1, buckets)
+    # Non-vision tokens contribute their own position only — they don't
+    # expand any block's iteration range beyond the standard SWA window.
+    group_lo = torch.where(is_vision, gathered_min, idx_b)
+    group_hi_excl = torch.where(is_vision, gathered_max + 1, idx_b + 1)
+
+    return _ImageGroupState(
+        group_ids=vision_group_ids.to(torch.int32).contiguous(),
+        group_lo=group_lo.to(torch.int32).contiguous(),
+        group_hi_excl=group_hi_excl.to(torch.int32).contiguous(),
+    )
 
 
 def triton_gqa_attention(
@@ -65,13 +145,57 @@ def triton_gqa_attention(
     slide = int(sliding_window) if sliding_window else 0
     is_causal = getattr(module, "is_causal", True)
 
+    # Image-bidirectional mask path (Gemma-4 MoE multimodal training):
+    # Sliding layers get an OR-mask that grants bidirectional attention
+    # within each vision span. Full layers don't (matches upstream:
+    # `create_causal_mask_mapping` only sets `or_mask_function` on
+    # `sliding_mask_kwargs`). The state is set by
+    # `patch_gemma4_image_group_ids_for_kernel` before the model forward.
+    group_state = _image_group_state.get()
+    use_image_groups = (group_state is not None) and (slide > 0) and is_causal
+
+    # Defensive guard: if the caller passed a 4D / BlockMask but no group
+    # state is in context, image bidirectional info would be silently
+    # dropped — fail loudly so the user installs the patch.
+    if (group_state is None) and (attention_mask is not None) and slide > 0 and is_causal:
+        is_4d = isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
+        from torch.nn.attention.flex_attention import BlockMask
+        is_blockmask = isinstance(attention_mask, BlockMask)
+        if is_4d or is_blockmask:
+            raise RuntimeError(
+                "triton_gqa_attention received a 4D / BlockMask attention_mask on "
+                "a sliding layer but no image-group state is set. If you are "
+                "training Gemma-4 multimodal, call "
+                "`patch_gemma4_image_group_ids_for_kernel()` before model load."
+            )
+
+    if use_image_groups:
+        # Cross-device safety: device_map="auto" spreads decoder layers across
+        # GPUs, but the ContextVar state was built on the input's device. Move
+        # the (small: B × N int64) tensors to the current Q device per-call;
+        # at ~16 KB per tensor × 3 tensors × 30 layers this is sub-ms overhead.
+        dev = query.device
+        group_args = (
+            group_state.group_ids.to(dev, non_blocking=True),
+            group_state.group_lo.to(dev, non_blocking=True),
+            group_state.group_hi_excl.to(dev, non_blocking=True),
+        )
+    else:
+        group_args = (None, None, None)
+
     # Multi-GPU (device_map="auto") safety: Triton launches kernels on
     # torch.cuda.current_device(), NOT on the tensor's device. accelerate's
     # layer dispatch moves tensors across GPUs but doesn't switch the current
     # device, so a layer on cuda:N would launch its Triton kernel on cuda:0's
     # stream — silently producing NaN output. Wrap the launch in a device ctx.
     with torch.cuda.device(query.device):
-        out = flash_attn_gqa_train(query, key, value, causal=is_causal, slide_size=slide)
+        out = flash_attn_gqa_train(
+            query, key, value,
+            causal=is_causal, slide_size=slide,
+            group_ids=group_args[0],
+            group_lo=group_args[1],
+            group_hi_excl=group_args[2],
+        )
     out = out.transpose(1, 2).contiguous()
     return out, None  # (attn_output, attn_weights)
 
@@ -227,3 +351,47 @@ def patch_gemma4_shared_kv_states_for_fsdp2() -> None:
     _forward_impl._patched_for_fsdp2 = True
     _forward_impl._original_forward = orig_forward
     mg.Gemma4TextModel.forward = _forward_impl
+
+
+def patch_gemma4_image_group_ids_for_kernel() -> None:
+    """Patch `Gemma4Model.forward` to compute the image-group state and stash
+    it in a ContextVar so the Triton adapter can fold the image-bidirectional
+    OR-mask into the kernel.
+
+    Required when training Gemma-4 multimodal **and** the text config has
+    `use_bidirectional_attention == "vision"` (currently only Gemma-4-26B-A4B
+    MoE). For E2B/E4B (`use_bidirectional_attention is None`) this is a no-op
+    in effect — the wrapper still sets up the ContextVar machinery but the
+    state stays empty so the adapter takes the standard causal/SWA path.
+
+    Idempotent (marks the patched method with an attribute). Safe to call
+    after `register_triton_attention()`.
+    """
+    from transformers.models.gemma4 import modeling_gemma4 as mg
+
+    if getattr(mg.Gemma4Model.forward, "_patched_for_image_groups", False):
+        return
+
+    orig_forward = mg.Gemma4Model.forward
+
+    def _wrapped(self, *args, **kwargs):
+        # Trigger only when (a) text-config opts into vision-bidirectional and
+        # (b) we actually have mm_token_type_ids (the prefill / training case
+        # — incremental decode doesn't carry them).
+        text_cfg = self.config.get_text_config()
+        wants_groups = getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
+        mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
+
+        token = None
+        if wants_groups and mm_token_type_ids is not None:
+            state = _compute_image_group_state(mm_token_type_ids)
+            token = _image_group_state.set(state)
+        try:
+            return orig_forward(self, *args, **kwargs)
+        finally:
+            if token is not None:
+                _image_group_state.reset(token)
+
+    _wrapped._patched_for_image_groups = True
+    _wrapped._original_forward = orig_forward
+    mg.Gemma4Model.forward = _wrapped

@@ -261,6 +261,18 @@ def _flash_attn_gqa_kernel(
     LSE_ptr,
     stride_lseb, stride_lseh, stride_lsen,
     STORE_LSE: tl.constexpr,
+    # Image-bidirectional OR-mask (Gemma-4 multimodal sliding layers).
+    # When HAS_GROUP_IDS=False the three pointers are unused and constant-folded
+    # away by the compiler. Group_ids[b, n] = -1 for non-vision tokens, else
+    # a per-batch group index. Group_lo/group_hi_excl are precomputed per-token
+    # bounds: for vision tokens, the [first, last+1) span of their image; for
+    # non-vision tokens, [n, n+1) (i.e., self-only — they never extend the
+    # block's iteration range beyond the standard SWA window).
+    GroupIds_ptr,
+    GroupLo_ptr,
+    GroupHi_ptr,
+    stride_gb, stride_gn,
+    HAS_GROUP_IDS: tl.constexpr,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_Q), B * N_Q_HEADS)
     q_block_idx = tl.program_id(0)
@@ -280,6 +292,23 @@ def _flash_attn_gqa_kernel(
     q_mask = q_offsets < SEQ_LEN
     d_range = tl.arange(0, HEAD_DIM)
 
+    # Image-group state for this Q block (loaded only when HAS_GROUP_IDS).
+    if HAS_GROUP_IDS:
+        g_base = GroupIds_ptr + b_idx * stride_gb
+        glo_base = GroupLo_ptr + b_idx * stride_gb
+        ghi_base = GroupHi_ptr + b_idx * stride_gb
+        # group_id for each q in the block (-1 for non-vision)
+        q_group_ids = tl.load(g_base + q_offsets * stride_gn, mask=q_mask, other=-1)
+        # group bounds — for non-vision tokens these collapse to (n, n+1) and
+        # don't extend beyond the SWA window.
+        q_group_lo = tl.load(glo_base + q_offsets * stride_gn, mask=q_mask, other=SEQ_LEN)
+        q_group_hi = tl.load(ghi_base + q_offsets * stride_gn, mask=q_mask, other=0)
+        # Per-block bidirectional reach: union of all q's image spans.
+        # Non-vision q's contribute (n, n+1) which sit inside the SWA window
+        # (since SWA includes self), so they never expand the bounds.
+        block_img_lo = tl.min(q_group_lo, axis=0)
+        block_img_hi = tl.max(q_group_hi, axis=0)
+
     # Determine KV iteration range.
     if IS_CAUSAL:
         kv_end = (q_block_idx + 1) * BLOCK_Q
@@ -291,6 +320,13 @@ def _flash_attn_gqa_kernel(
         kv_loop_start = (kv_min // BLOCK_KV) * BLOCK_KV
     else:
         kv_loop_start = 0
+
+    # Extend bounds to cover the full image-group span when present.
+    # Non-image blocks leave bounds unchanged (block_img_hi <= kv_end already,
+    # block_img_lo >= kv_loop_start already). Round to BLOCK_KV.
+    if HAS_GROUP_IDS:
+        kv_loop_start = tl.minimum(kv_loop_start, (block_img_lo // BLOCK_KV) * BLOCK_KV)
+        kv_end = tl.maximum(kv_end, block_img_hi)
 
     LOG2E: tl.constexpr = 1.4426950408889634
     scale_log2e = scale * LOG2E
@@ -304,8 +340,10 @@ def _flash_attn_gqa_kernel(
     # FA2/FA3 use the same pattern. At HEAD_DIM=512 the register pressure from
     # the two-loop code makes this a net loss (matmul already dominates, mask
     # overhead is negligible), so skip the split there.
+    # When HAS_GROUP_IDS, every tile may need an OR-mask check, so the unmasked
+    # phase optimization is unsafe — disable it.
     USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)
-    if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT:
+    if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT and not HAS_GROUP_IDS:
         kv_end_unmasked = (q_block_idx * BLOCK_Q) // BLOCK_KV * BLOCK_KV
     else:
         kv_end_unmasked = kv_loop_start  # skip unmasked phase
@@ -353,10 +391,21 @@ def _flash_attn_gqa_kernel(
                 valid = (kv_offsets[None, :] <= q_offsets[:, None]) & kv_mask[None, :]
         else:
             valid = kv_mask[None, :]
+        # Image-bidirectional OR-mask: queries within a vision span see all
+        # keys in the same span (regardless of causal direction or SWA window).
+        # Mirrors `token_type_ids_mask_function` in modeling_gemma4.py:1990.
+        if HAS_GROUP_IDS:
+            kv_group_ids = tl.load(g_base + kv_offsets * stride_gn,
+                                   mask=kv_mask, other=-1)
+            bidir = (q_group_ids[:, None] == kv_group_ids[None, :]) & \
+                    (q_group_ids[:, None] >= 0) & kv_mask[None, :]
+            valid = valid | bidir
         scores = tl.where(valid, scores, -float("inf"))
 
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(m_i, block_max)
+        # SWA may produce all-masked rows (no key visible); HAS_GROUP_IDS
+        # implies SWA path and inherits the same NaN-clamp safeguard.
         if SLIDE_SIZE > 0:
             safe_new = tl.maximum(new_max, -1e20)
             alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
@@ -538,6 +587,7 @@ def _flash_attn_gqa_grouped_kernel(
 
 
 def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
+                        group_ids=None, group_lo=None, group_hi_excl=None,
                         BLOCK_Q=None, BLOCK_KV=None,
                         BLOCK_D=None, num_warps=None, num_stages=None):
     """
@@ -548,6 +598,12 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     causal:     if True, apply causal mask (q_i attends only to k_j where j <= i)
     slide_size: sliding window size (0 = disabled). When > 0 and causal=True,
                 q_i attends to k_j where max(0, i - slide_size + 1) <= j <= i.
+    group_ids:  optional (B, N) int32 vision-group ids for the image-
+                bidirectional OR-mask (Gemma-4 multimodal). -1 = non-vision.
+                Must be passed together with `group_lo` and `group_hi_excl`.
+    group_lo / group_hi_excl: (B, N) int32 — per-token bidirectional reach
+                used to extend the kernel's KV iteration bounds when an image
+                spans beyond the SWA window.
     """
     B, H_Q, N, D = q.shape
     _, H_KV, _, _ = k.shape
@@ -580,6 +636,14 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
 
     grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
 
+    has_group_ids = group_ids is not None
+    if has_group_ids:
+        assert group_lo is not None and group_hi_excl is not None, \
+            "group_ids requires both group_lo and group_hi_excl"
+        g_strides = (group_ids.stride(0), group_ids.stride(1))
+    else:
+        g_strides = (0, 0)
+
     _flash_attn_gqa_kernel[grid](
         q, k, v, output,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -598,6 +662,9 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
         SLIDE_SIZE=slide_size,
         LSE_ptr=None, stride_lseb=0, stride_lseh=0, stride_lsen=0,
         STORE_LSE=False,
+        GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
+        stride_gb=g_strides[0], stride_gn=g_strides[1],
+        HAS_GROUP_IDS=has_group_ids,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -703,6 +770,12 @@ def _flash_attn_gqa_bwd_dq_kernel(
     IS_CAUSAL: tl.constexpr,
     SLIDE_SIZE: tl.constexpr,  # 0 = no sliding window
     STORE_DELTA: tl.constexpr,  # True: fuse delta = rowsum(dO * O) into dQ prologue
+    # Image-bidirectional OR-mask (mirror of fwd kernel — see _flash_attn_gqa_kernel).
+    GroupIds_ptr,
+    GroupLo_ptr,
+    GroupHi_ptr,
+    stride_gb, stride_gn,
+    HAS_GROUP_IDS: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     bh_idx = tl.program_id(1)
@@ -755,6 +828,19 @@ def _flash_attn_gqa_bwd_dq_kernel(
     else:
         kv_loop_start = 0
 
+    # Image-group state and bound expansion (mirrors fwd kernel).
+    if HAS_GROUP_IDS:
+        g_base = GroupIds_ptr + b_idx * stride_gb
+        glo_base = GroupLo_ptr + b_idx * stride_gb
+        ghi_base = GroupHi_ptr + b_idx * stride_gb
+        q_group_ids = tl.load(g_base + q_offsets * stride_gn, mask=q_mask, other=-1)
+        q_group_lo = tl.load(glo_base + q_offsets * stride_gn, mask=q_mask, other=SEQ_LEN)
+        q_group_hi = tl.load(ghi_base + q_offsets * stride_gn, mask=q_mask, other=0)
+        block_img_lo = tl.min(q_group_lo, axis=0)
+        block_img_hi = tl.max(q_group_hi, axis=0)
+        kv_loop_start = tl.minimum(kv_loop_start, (block_img_lo // BLOCK_KV) * BLOCK_KV)
+        kv_end = tl.maximum(kv_end, block_img_hi)
+
     dq_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
 
     # Convert LSE to log2 domain once so we can use tl.math.exp2 inside the loop.
@@ -781,6 +867,12 @@ def _flash_attn_gqa_bwd_dq_kernel(
                 valid = (kv_offsets[None, :] <= q_offsets[:, None]) & kv_mask[None, :]
         else:
             valid = kv_mask[None, :]
+        if HAS_GROUP_IDS:
+            kv_group_ids = tl.load(g_base + kv_offsets * stride_gn,
+                                   mask=kv_mask, other=-1)
+            bidir = (q_group_ids[:, None] == kv_group_ids[None, :]) & \
+                    (q_group_ids[:, None] >= 0) & kv_mask[None, :]
+            valid = valid | bidir
         scores = tl.where(valid, scores, -float("inf"))
         p = tl.math.exp2(scores - lse_log2[:, None])
 
@@ -1097,6 +1189,13 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     IS_CAUSAL: tl.constexpr,
     SLIDE_SIZE: tl.constexpr,
     Q_SPLITS: tl.constexpr,  # 1 = direct store; >1 = atomic_add (caller pre-zeros dK/dV)
+    # Image-bidirectional OR-mask (mirror of fwd). For KV-major iteration we
+    # extend the Q-loop bounds based on the KV block's image-group reach.
+    GroupIds_ptr,
+    GroupLo_ptr,
+    GroupHi_ptr,
+    stride_gb, stride_gn,
+    HAS_GROUP_IDS: tl.constexpr,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS)
     kv_block_idx = tl.program_id(0)
@@ -1143,6 +1242,25 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     else:
         q_loop_end = SEQ_LEN
 
+    # Image-group state for this KV block. Extends Q-loop bounds symmetrically
+    # to fwd/dQ: any image-KV in this block is bidirectionally visible to all
+    # Q's in the same image span.
+    if HAS_GROUP_IDS:
+        g_base = GroupIds_ptr + b_idx * stride_gb
+        glo_base = GroupLo_ptr + b_idx * stride_gb
+        ghi_base = GroupHi_ptr + b_idx * stride_gb
+        kv_group_ids = tl.load(g_base + kv_offsets * stride_gn,
+                               mask=kv_mask, other=-1)
+        kv_group_lo = tl.load(glo_base + kv_offsets * stride_gn,
+                              mask=kv_mask, other=SEQ_LEN)
+        kv_group_hi = tl.load(ghi_base + kv_offsets * stride_gn,
+                              mask=kv_mask, other=0)
+        block_img_lo = tl.min(kv_group_lo, axis=0)
+        block_img_hi = tl.max(kv_group_hi, axis=0)
+        q_start = tl.minimum(q_start, (block_img_lo // BLOCK_Q) * BLOCK_Q)
+        q_loop_end = tl.maximum(q_loop_end, block_img_hi)
+        # q_loop_end may exceed SEQ_LEN at the tail; mask handles it inside loop.
+
     # Q-split: each of Q_SPLITS programs handles a disjoint slice of Q blocks.
     # Activated when raw grid << 132 SMs (e.g. H_KV=1 short N). Atomic_add on
     # dK/dV (caller pre-zeroed) replaces direct store.
@@ -1188,6 +1306,13 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
                             kv_mask[None, :] & q_mask_local[:, None]
             else:
                 valid = kv_mask[None, :] & q_mask_local[:, None]
+            if HAS_GROUP_IDS:
+                q_group_ids = tl.load(g_base + q_offsets * stride_gn,
+                                      mask=q_mask_local, other=-1)
+                bidir = (q_group_ids[:, None] == kv_group_ids[None, :]) & \
+                        (q_group_ids[:, None] >= 0) & \
+                        kv_mask[None, :] & q_mask_local[:, None]
+                valid = valid | bidir
             scores = tl.where(valid, scores, -float("inf"))
             p = tl.math.exp2(scores - lse_log2[:, None])
 
@@ -1432,7 +1557,7 @@ def _flash_attn_gqa_bwd_dk_only_kernel(
 
 class FlashAttnGQAFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, slide_size):
+    def forward(ctx, q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl):
         B, H_Q, N, D = q.shape
         _, H_KV, _, _ = k.shape
         output = torch.empty_like(q)
@@ -1451,6 +1576,13 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
         grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
 
+        has_group_ids = group_ids is not None
+        if has_group_ids:
+            assert group_lo is not None and group_hi_excl is not None
+            g_strides = (group_ids.stride(0), group_ids.stride(1))
+        else:
+            g_strides = (0, 0)
+
         _flash_attn_gqa_kernel[grid](
             q, k, v, output,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -1464,19 +1596,28 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             SLIDE_SIZE=slide_size,
             LSE_ptr=lse, stride_lseb=lse.stride(0), stride_lseh=lse.stride(1),
             stride_lsen=lse.stride(2), STORE_LSE=True,
+            GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
+            stride_gb=g_strides[0], stride_gn=g_strides[1],
+            HAS_GROUP_IDS=has_group_ids,
             num_warps=num_warps, num_stages=num_stages,
         )
 
-        ctx.save_for_backward(q, k, v, output, lse)
+        # save_for_backward supports None entries (kept as None in saved_tensors).
+        ctx.save_for_backward(q, k, v, output, lse, group_ids, group_lo, group_hi_excl)
         ctx.causal = causal
         ctx.slide_size = slide_size
+        ctx.has_group_ids = has_group_ids
         return output
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, lse = ctx.saved_tensors
+        q, k, v, o, lse, group_ids, group_lo, group_hi_excl = ctx.saved_tensors
         causal = ctx.causal
         slide_size = ctx.slide_size
+        has_group_ids = ctx.has_group_ids
+        g_strides_dq = (
+            (group_ids.stride(0), group_ids.stride(1)) if has_group_ids else (0, 0)
+        )
         B, H_Q, N, D = q.shape
         _, H_KV, _, _ = k.shape
         scale = 1.0 / math.sqrt(D)
@@ -1519,6 +1660,9 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
             STORE_DELTA=True,
+            GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
+            stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
+            HAS_GROUP_IDS=has_group_ids,
             num_warps=num_warps_bw, num_stages=2,
         )
 
@@ -1616,13 +1760,17 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             IS_CAUSAL=causal,
             SLIDE_SIZE=slide_size,
             Q_SPLITS=Q_SPLITS_DKV,
+            GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
+            stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
+            HAS_GROUP_IDS=has_group_ids,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
-        return dq, dk, dv, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
-def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0):
+def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
+                         group_ids=None, group_lo=None, group_hi_excl=None):
     """Flash Attention GQA with backward pass support for training.
 
     Args:
@@ -1631,8 +1779,13 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0):
         v: (B, N_KV_HEADS, N, D)
         causal:     causal masking
         slide_size: sliding window size (0 = disabled, must be causal=True to have effect)
+        group_ids / group_lo / group_hi_excl: optional (B, N) int32 tensors
+            enabling the image-bidirectional OR-mask path for Gemma-4
+            multimodal training. See `attention_flash_gqa` for semantics.
     """
-    return FlashAttnGQAFunction.apply(q, k, v, causal, slide_size)
+    return FlashAttnGQAFunction.apply(
+        q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
+    )
 
 
 # --- Benchmark ---

@@ -51,6 +51,7 @@ from .hf_integration import (
     triton_gqa_attention,
     patch_transformers_5_5_4_flash_attn_key,
     patch_gemma4_shared_kv_states_for_fsdp2,
+    patch_gemma4_image_group_ids_for_kernel,
 )
 
 __version__ = "0.1.0"
@@ -67,5 +68,6 @@ __all__ = [
     "triton_gqa_attention",
     "patch_transformers_5_5_4_flash_attn_key",
     "patch_gemma4_shared_kv_states_for_fsdp2",
+    "patch_gemma4_image_group_ids_for_kernel",
     "__version__",
 ]

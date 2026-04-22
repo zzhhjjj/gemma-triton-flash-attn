@@ -3,7 +3,8 @@
 This document records the optimization strategies that were implemented and
 measured. Wins that shipped: pack-GQA dKV kernel, softmax `exp2`, split
 causal-mask loop. Dead ends kept in source for reference: multi-head fusion
-fwd, atomic fused bwd.
+fwd, atomic fused bwd. Tiling/pipeline probes at D=512 (extra `num_stages`,
+Split-D) also lost — see below.
 
 Further quantitative tables live in [`../context/baseline.md`](../context/baseline.md).
 
@@ -53,6 +54,22 @@ enough that on D=512 the gain from skipping mask ops is lost to spills
 (matmul is already the bottleneck). The wrapper sets
 `USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)`, so D=512 uses a single-loop
 body while D<512 uses the split.
+
+## MFU at production shapes (H100, bf16, N=8K)
+
+Measured forward attention MFU (peak = 989 TFLOPS).
+Reproducer: `benchmarks/mfu_sweep.py`. Per-shape breakdown and config table
+in [`architecture.md`](architecture.md#target-model-attention-shapes).
+
+| Path (per layer) | Triton MFU | SDPA MFU | speedup |
+|---|---:|---:|---:|
+| D=256 sliding (E2B/E4B/MoE bulk) | 24-32% | 0.7-1.4% | 23-38× |
+| D=256 full causal (Gemma-3 ref)   | 47%    | 27%      | 1.8×   |
+| **D=512 full causal (E2B/E4B/MoE)** | **17-19%** | 10-11%   | 1.7×  |
+
+The D=512 full path is the lowest MFU and where remaining headroom lives.
+Per-call cost is ≈24× a sliding layer at N=8K, so even though only 5-7 of
+30-42 layers run on this path, it dominates per-step attention time.
 
 ## Remaining gap to FA2/FA3
 
@@ -147,6 +164,67 @@ exceeded the 232 KB SM budget); reducing to BQ=16 fixed the launch failure
 but didn't help the atomic contention.
 
 Reproducer: `tests/test_fused_backward.py`.
+
+## ❌ Pipeline stages at D=512 forward (`num_stages ≥ 3`)
+
+**Idea.** Current baseline @ D=512 is pinned to `num_stages=2` by the 232 KB
+SMEM budget: `Q (64 KB) + 2 × (K 32 KB + V 32 KB) = 192 KB`. Going to
+`num_stages=3` needs another 64 KB → 256 KB, exceeds the budget. Workaround:
+shrink `BLOCK_KV` so a third stage fits.
+
+**Result (H_Q=32, H_KV=4, D=512, causal, bf16, H100):**
+
+| config                     | N=4K ms  | N=8K ms  | SMEM    | regs/spills |
+|----------------------------|----------|----------|---------|-------------|
+| **baseline BKV=32 s=2**    | **7.41** | **27.81**| 192 KB  | 255 / 4     |
+| BKV=16 s=2                 | 11.06    | 41.77    | 128 KB  | 255 / 12    |
+| BKV=16 s=3                 | 10.42    | 39.37    | 160 KB  | 255 / 14    |
+| BKV=16 s=4                 | 10.44    | 39.50    | 192 KB  | 255 / 14    |
+| BQ=32 BKV=32 s=3           | 10.26    | 39.69    | 162 KB  | 255 / 2     |
+| BQ=32 BKV=64 s=2           | 9.12     | 39.71    | 164 KB  | 255 / 4     |
+| BKV=32 s=3 / BKV=64 s=2    | OOS      | OOS      | —       | —           |
+
+Shrinking `BLOCK_KV` to 16 to pay for a third stage costs more than the
+pipeline wins: `tl.dot` on `[BQ=64, BKV=16]` output gives the H100 tensor
+core a tile too small to hide its own issue latency. Every config lost to
+baseline.
+
+Reproducer: `benchmarks/split_d_probe.py`.
+
+## ❌ Split-D forward at D=512
+
+**Idea (from the FA2/FA3 lineage).** Tile `HEAD_DIM` into chunks of size
+`BLOCK_D` (e.g., 128). For each KV tile, accumulate `scores = ΣchunksQ_d @
+K_d^T` over a `tl.static_range(0, D, BLOCK_D)` inner loop, then update
+`acc[:, d_chunk]` per chunk. The advertised win is that per-stage K/V SMEM
+buffers shrink to `BKV × BLOCK_D × 2` bytes, unlocking `BLOCK_KV=128
+num_stages=2` (192 KB est.) or `BLOCK_KV=64 num_stages=3` (160 KB est.) —
+4× the current KV tile with better tensor-core utilization.
+
+**Result: the SMEM win does not materialize in Triton 3.x.**
+
+Tested both "Split-D on QK^T only, full-D V matmul" (Approach A) and "Split-D
+on both matmuls" (Approach B). A compiled correctly and produced bit-exact
+output vs baseline, but any `BLOCK_KV ≥ 64` config compiled to 2× the
+expected SMEM usage. Example: `BQ=64, BKV=64, BD=128, s=2` theoretical SMEM
+is `Q 64 KB + 2×(K-chunk 16 KB + V-full 64 KB) = 224 KB`, but Triton
+requested 320 KB. At `BKV=32, BD=128, s=2` the kernel ran in 6.88 ms vs
+baseline 6.81 ms — no regression, no win.
+
+**Root cause.** Triton's software pipeliner treats `tl.static_range` as a
+fully-unrolled block inside each pipeline stage, so it stages *all* D-chunk
+K loads simultaneously rather than serializing them. The per-stage SMEM
+ends up ≈ the sum over all D-chunks, defeating the entire SMEM reduction
+that Split-D is designed to provide. CUTLASS/CuTeDSL can express a true
+inner D-loop with independent stages; Triton 3.x cannot.
+
+Approach B (per-chunk `acc[:, d]` update) also hits a Triton language wall:
+sliced assignment on a 2D register tile (`acc[:, d0:d1] = ...`) is not
+expressible, and the arithmetic-masked-scatter workaround compiles to the
+same unrolled block the pipeliner chokes on.
+
+Reproducers: `benchmarks/split_d_probe.py` (tiling sweep),
+`benchmarks/split_d_proto.py` (Split-D kernel).
 
 ## Takeaway
 

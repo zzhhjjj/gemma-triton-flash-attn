@@ -49,6 +49,8 @@ def run_forward_with_lse(q, k, v, *, causal, slide_size):
         IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
         LSE_ptr=lse, stride_lseb=lse.stride(0), stride_lseh=lse.stride(1),
         stride_lsen=lse.stride(2), STORE_LSE=True,
+        GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
+        stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
         num_warps=num_warps, num_stages=2,
     )
     return output, lse, slide_size
@@ -148,6 +150,8 @@ def run_dkv_packed(q, k, v, do, lse, delta, *, causal, slide_size,
         GQA_RATIO=GQA_RATIO,
         IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
         Q_SPLITS=1,
+        GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
+        stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
         num_warps=num_warps, num_stages=2,
     )
     return dk, dv
