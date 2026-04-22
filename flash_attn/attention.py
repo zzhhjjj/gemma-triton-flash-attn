@@ -4,6 +4,16 @@ import triton.language as tl
 import math
 
 
+# Blackwell (sm_100) reports ~227 KB max dynamic shared mem, ~1 KB less than
+# Hopper. Triton 3.5.1 doesn't yet emit TMA-backed loads on sm_100, so the
+# fwd/bwd configs that fit on H100 with num_stages=2 (Q+O+2×KV ≈ 256 KB)
+# overflow on B200. Until proper sm_100 tuning lands, clamp num_stages to 1.
+def _stages(default: int) -> int:
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 10:
+        return 1
+    return default
+
+
 # =====================================================================
 # PyTorch reference: scaled dot-product attention
 # =====================================================================
@@ -620,8 +630,17 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     #   D=256 (Gemma4 sliding attn):  (BQ=128, BKV=64) — more headroom, larger blocks win
     #   D<256:                        (BQ=128, BKV=64) — same as D=256
     # num_warps=8 for D>=256 (large tiles need many warps to hide latency).
+    # On sm_100 (Blackwell), the same SMEM/wgmma-layout constraints that hit
+    # FlashAttnGQAFunction.forward apply here — see the matching gates there.
+    is_blackwell_a = (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] >= 10
+    )
     if BLOCK_Q is None:
-        BLOCK_Q = 64 if D >= 512 else 128
+        if D >= 512:
+            BLOCK_Q = 32 if is_blackwell_a else 64
+        else:
+            BLOCK_Q = 128
     if BLOCK_KV is None:
         BLOCK_KV = 32 if D >= 512 else 64
     if BLOCK_D is None:
@@ -629,7 +648,7 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     if num_warps is None:
         num_warps = 8 if D >= 256 else 4
     if num_stages is None:
-        num_stages = 2
+        num_stages = _stages(2)
 
     BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
     BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
@@ -1567,11 +1586,23 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= N:
             slide_size = 0
 
-        BLOCK_Q = 64 if D >= 512 else 128
-        BLOCK_KV = 32 if D >= 512 else 64
+        # On sm_100 (Blackwell), Triton 3.5.1 lacks the TMA path used on Hopper.
+        # D=512 with BLOCK_Q=64 trips a misaligned-address fault in fwd; halving
+        # BLOCK_Q sidesteps the offending wgmma layout. D=256 still uses the
+        # H100 config since num_stages=1 already shrank SMEM to fit (~227 KB).
+        is_blackwell = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability(0)[0] >= 10
+        )
+        if D >= 512:
+            BLOCK_Q = 32 if is_blackwell else 64
+            BLOCK_KV = 32
+        else:
+            BLOCK_Q = 128
+            BLOCK_KV = 64
         BLOCK_D = D
         num_warps = 8 if D >= 256 else 4
-        num_stages = 2
+        num_stages = _stages(2)
         BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
         BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
         grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
@@ -1636,8 +1667,16 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # D-specific tuning (sweeps in context/baseline.md):
         #   D=512: (BQ=32, BKV=64, w=8)  — register-constrained, need 8 warps
         #   D=256: (BQ=64, BKV=64, w=4)  — more headroom, larger BQ + fewer warps win
+        # On sm_100 (Blackwell), shrink BLOCK_KV for D=512 to dodge the same
+        # wgmma-layout misaligned-address fault that hit the fwd kernel.
+        is_blackwell_bw = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability(0)[0] >= 10
+        )
         if D >= 512:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
+            BLOCK_Q_BW = 32
+            BLOCK_KV_BW = 32 if is_blackwell_bw else 64
+            num_warps_bw = 8
         else:
             BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
         BLOCK_Q_BW = min(BLOCK_Q_BW, triton.next_power_of_2(N))
@@ -1663,7 +1702,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
-            num_warps=num_warps_bw, num_stages=2,
+            num_warps=num_warps_bw, num_stages=_stages(2),
         )
 
         # --- dK, dV kernel (packed: KV-major, inline GQA Q-head loop) ---
@@ -1682,8 +1721,13 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
             # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
             # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
-            num_stages_dkv = 2
+            # On sm_100, halve BLOCK_Q_DKV to avoid the wgmma alignment fault
+            # that bites D=512 paths.
+            if is_blackwell_bw:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 32, 4
+            else:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
+            num_stages_dkv = _stages(2)
         else:
             # D<512: (BKV=64, BQ=128, w=8, s=1) is the big-tile config that
             # wins when grid is healthy. We use it in TWO regimes:
@@ -1703,7 +1747,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
                 num_stages_dkv = 1
             else:
                 BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
-                num_stages_dkv = 2
+                num_stages_dkv = _stages(2)
         BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))
         BLOCK_Q_DKV = min(BLOCK_Q_DKV, triton.next_power_of_2(N))
 

@@ -23,8 +23,16 @@ from gemma_triton_flash_attn.attention import (
     _flash_attn_gqa_bwd_dkv_kernel,
     _flash_attn_gqa_bwd_dkv_packed_kernel,
     _delta_kernel,
+    _stages,
 )
 from gemma_triton_flash_attn.utils import benchmark_fn
+
+
+def _is_blackwell() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(0)[0] >= 10
+    )
 
 
 def run_forward_with_lse(q, k, v, *, causal, slide_size):
@@ -32,8 +40,12 @@ def run_forward_with_lse(q, k, v, *, causal, slide_size):
     _, H_KV, _, _ = k.shape
     if slide_size > 0 and slide_size >= N:
         slide_size = 0
-    BQ = min(64 if D >= 512 else 128, triton.next_power_of_2(N))
-    BKV = min(32 if D >= 512 else 64, triton.next_power_of_2(N))
+    if D >= 512 and _is_blackwell():
+        BQ = min(32, triton.next_power_of_2(N))
+        BKV = min(32, triton.next_power_of_2(N))
+    else:
+        BQ = min(64 if D >= 512 else 128, triton.next_power_of_2(N))
+        BKV = min(32 if D >= 512 else 64, triton.next_power_of_2(N))
     num_warps = 8 if D >= 256 else 4
     output = torch.empty_like(q)
     lse = torch.empty(B, H_Q, N, dtype=torch.float32, device=q.device)
@@ -51,7 +63,7 @@ def run_forward_with_lse(q, k, v, *, causal, slide_size):
         stride_lsen=lse.stride(2), STORE_LSE=True,
         GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
         stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
-        num_warps=num_warps, num_stages=2,
+        num_warps=num_warps, num_stages=_stages(2),
     )
     return output, lse, slide_size
 
@@ -64,7 +76,7 @@ def run_delta(do, o):
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         delta.stride(0), delta.stride(1), delta.stride(2),
-        N_HEADS=H, SEQ_LEN=N, HEAD_DIM=D, num_warps=4, num_stages=2,
+        N_HEADS=H, SEQ_LEN=N, HEAD_DIM=D, num_warps=4, num_stages=_stages(2),
     )
     return delta
 
@@ -77,7 +89,10 @@ def run_dkv_split(q, k, v, do, lse, delta, *, causal, slide_size):
     scale = 1.0 / math.sqrt(D)
 
     if D >= 512:
-        BQ, BKV, nw = 16, 32, 8
+        if _is_blackwell():
+            BQ, BKV, nw = 32, 16, 4
+        else:
+            BQ, BKV, nw = 16, 32, 8
     else:
         BQ, BKV, nw = 64, 32, 4
     BQ = min(BQ, triton.next_power_of_2(N))
@@ -100,7 +115,7 @@ def run_dkv_split(q, k, v, do, lse, delta, *, causal, slide_size):
         BLOCK_Q=BQ, BLOCK_KV=BKV,
         IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
         ATOMIC_REDUCE=False,
-        num_warps=nw, num_stages=2,
+        num_warps=nw, num_stages=_stages(2),
     )
 
     if GQA_RATIO == 2:
@@ -124,11 +139,20 @@ def run_dkv_packed(q, k, v, do, lse, delta, *, causal, slide_size,
 
     # Block sizes: same as split kernel (same register budget)
     if BQ is None:
-        BQ = 16 if D >= 512 else 64
+        if D >= 512 and _is_blackwell():
+            BQ = 32
+        else:
+            BQ = 16 if D >= 512 else 64
     if BKV is None:
-        BKV = 32
+        if D >= 512 and _is_blackwell():
+            BKV = 16
+        else:
+            BKV = 32
     if num_warps is None:
-        num_warps = 8 if D >= 512 else 4
+        if D >= 512 and _is_blackwell():
+            num_warps = 4
+        else:
+            num_warps = 8 if D >= 512 else 4
     BQ = min(BQ, triton.next_power_of_2(N))
     BKV = min(BKV, triton.next_power_of_2(N))
 
@@ -152,7 +176,7 @@ def run_dkv_packed(q, k, v, do, lse, delta, *, causal, slide_size,
         Q_SPLITS=1,
         GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
         stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
-        num_warps=num_warps, num_stages=2,
+        num_warps=num_warps, num_stages=_stages(2),
     )
     return dk, dv
 

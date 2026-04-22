@@ -177,6 +177,9 @@ def main():
     p.add_argument("--sanity-no-images", action="store_true",
                    help="Set mm_token_type_ids all-zero (text-only) — if this "
                         "also fails, the problem is model-wide, not OR-mask.")
+    p.add_argument("--all-layers", action="store_true",
+                   help="Print per-layer cos sim for every decoder layer "
+                        "(default: a small sample at 0,1,2,5,10,15,20,25,last).")
     args = p.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -243,9 +246,12 @@ def main():
     # Per-layer drift — tells us whether deviation is accumulated model noise
     # or a per-layer kernel bug. We expect small at layer 0 and growing slowly.
     print(f"\n[layer drift] {'layer':>5} {'cos':>10} {'rel_frob':>10}")
-    for i in (0, 1, 2, 5, 10, 15, 20, 25, len(h_ref) - 1):
-        if i >= len(h_ref):
-            continue
+    if args.all_layers:
+        layer_indices = range(len(h_ref))
+    else:
+        layer_indices = [i for i in (0, 1, 2, 5, 10, 15, 20, 25, len(h_ref) - 1)
+                         if i < len(h_ref)]
+    for i in layer_indices:
         a, b = h_ref[i].float(), h_tri[i].float()
         cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
         rel = ((a - b).norm() / a.norm()).item()
