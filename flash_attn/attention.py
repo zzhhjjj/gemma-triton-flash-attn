@@ -647,7 +647,14 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
         if D >= 512:
             BLOCK_KV = 32
         else:
-            BLOCK_KV = 128 if is_blackwell_a else 64
+            # See FlashAttnGQAFunction.forward — BKV=128 only for low-GQA
+            # (MoE-style 2:1) shapes where it actually wins; high-GQA (E2B
+            # 8:1) regresses at small N with the wider tile.
+            gqa_ratio_a = H_Q // H_KV
+            if is_blackwell_a and gqa_ratio_a <= 4:
+                BLOCK_KV = 128
+            else:
+                BLOCK_KV = 64
     if BLOCK_D is None:
         BLOCK_D = D  # no D-tiling: single tl.dot per KV tile
     if num_warps is None:
@@ -1605,12 +1612,18 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         #   D=512: (BQ=32, BKV=32, w=4, s=2) wins all N (1.11-1.20x SDPA);
         #          previous (w=8, s=1) was 0.85x. Fewer warps + double-buffer
         #          beats more warps + single-buffer at this small block.
-        #   D=256: (BQ=128, BKV=128, w=8, s=1) wins at N=1K-2K and is within
-        #          1% of best at N>=4K. Previous BKV=64 was 17-18% slower.
+        #   D=256: (BQ=128, BKV=128, w=8, s=1) wins at the MoE shape (GQA 2:1).
+        #          For high-GQA shapes (H_KV=1, GQA>=8), each KV head maps to
+        #          many Q heads but the per-program K load is full BKV*D = 128*256
+        #          = 64KB; with one KV head only N/BKV programs walk it, and the
+        #          smaller BKV=64 keeps SMs fed at small N where occupancy is
+        #          tight. Switch threshold (GQA<=4) keeps Config B (E2B 8:1)
+        #          on the BKV=64 path while MoE 2:1 stays on BKV=128.
         is_blackwell = (
             torch.cuda.is_available()
             and torch.cuda.get_device_capability(0)[0] >= 10
         )
+        gqa_ratio = H_Q // H_KV
         if D >= 512:
             BLOCK_Q = 32 if is_blackwell else 64
             BLOCK_KV = 32
@@ -1618,7 +1631,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             num_stages = 2 if is_blackwell else _stages(2)
         else:
             BLOCK_Q = 128
-            BLOCK_KV = 128 if is_blackwell else 64
+            if is_blackwell:
+                BLOCK_KV = 128 if gqa_ratio <= 4 else 64
+            else:
+                BLOCK_KV = 64
             num_warps = 8 if D >= 256 else 4
             num_stages = _stages(2)
         BLOCK_D = D
@@ -1686,18 +1702,36 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # D-specific tuning (sweeps in context/baseline.md):
         #   D=512: (BQ=32, BKV=64, w=8)  — register-constrained, need 8 warps
         #   D=256: (BQ=64, BKV=64, w=4)  — more headroom, larger BQ + fewer warps win
-        # On sm_100 (Blackwell), shrink BLOCK_KV for D=512 to dodge the same
-        # wgmma-layout misaligned-address fault that hit the fwd kernel.
+        # On sm_100 (Blackwell), b200_moe_bwd_tune.py @ MoE shape (H_Q=16, H_KV=8)
+        # 2026-04-23 sweep finds different winners. Same wgmma alignment fault
+        # constraints as fwd: BQ stays at 32 for D=512.
+        #   D=512: (BQ=32, BKV=64, w=4, s=2) — ~40% faster than the previous
+        #          (BQ=32, BKV=32, w=8, s=1). BKV=64 doesn't fault for the dQ
+        #          kernel even though it does for fwd (different mma layout).
+        #   D=256: (BQ=128, BKV=32, w=8, s=2) — ~12-17% faster than the
+        #          (BQ=64, BKV=64, w=4) H100 default. Larger BQ amortizes,
+        #          smaller BKV + double-buffer keeps SMs fed.
         is_blackwell_bw = (
             torch.cuda.is_available()
             and torch.cuda.get_device_capability(0)[0] >= 10
         )
         if D >= 512:
             BLOCK_Q_BW = 32
-            BLOCK_KV_BW = 32 if is_blackwell_bw else 64
-            num_warps_bw = 8
+            if is_blackwell_bw:
+                BLOCK_KV_BW = 64
+                num_warps_bw = 4
+                num_stages_bw = 2
+            else:
+                BLOCK_KV_BW = 64
+                num_warps_bw = 8
+                num_stages_bw = _stages(2)
         else:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
+            if is_blackwell_bw:
+                BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 128, 32, 8
+                num_stages_bw = 2
+            else:
+                BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
+                num_stages_bw = _stages(2)
         BLOCK_Q_BW = min(BLOCK_Q_BW, triton.next_power_of_2(N))
         BLOCK_KV_BW = min(BLOCK_KV_BW, triton.next_power_of_2(N))
         grid_dq = (triton.cdiv(N, BLOCK_Q_BW), B * H_Q)
@@ -1721,7 +1755,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
-            num_warps=num_warps_bw, num_stages=_stages(2),
+            num_warps=num_warps_bw, num_stages=num_stages_bw,
         )
 
         # --- dK, dV kernel (packed: KV-major, inline GQA Q-head loop) ---
@@ -1740,13 +1774,17 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
             # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
             # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
-            # On sm_100, halve BLOCK_Q_DKV to avoid the wgmma alignment fault
-            # that bites D=512 paths.
+            # On sm_100, b200_moe_bwd_tune.py @ MoE shape sweep 2026-04-23:
+            #   (BQ=32, BKV=32, w=8, s=1) wins at large N (69.1ms vs 73.2 for the
+            #   prior H100-shrunk default at N=16K) — square 32×32 keeps the
+            #   accumulator + Q/dO load aligned without tripping the wgmma fault
+            #   that BQ>=64 triggers at D=512. ~5-6% improvement.
             if is_blackwell_bw:
-                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 32, 4
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 32, 8
+                num_stages_dkv = 1
             else:
                 BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
-            num_stages_dkv = _stages(2)
+                num_stages_dkv = _stages(2)
         else:
             # D<512: (BKV=64, BQ=128, w=8, s=1) is the big-tile config that
             # wins when grid is healthy. We use it in TWO regimes:
