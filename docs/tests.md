@@ -84,3 +84,23 @@ python benchmarks/replot.py
   split-and-reduce baseline.
 - `tests/test_grouped_forward.py` — multi-head fusion (dead end) repro.
 - `tests/test_fused_backward.py` — atomic fused bwd (dead end) repro.
+
+## Varlen (packed / cu_seqlens) — `tests/test_varlen_*.py`
+
+Covers the `flash_attn_gqa_varlen` API (see [`docs/varlen.md`](varlen.md)).
+
+```bash
+# 1. Forward + backward vs per-sample SDPA; equal-length equivalence vs batched kernel
+python tests/test_varlen_correctness.py
+
+# 2. Edge cases (B=1, single-token, skewed [1,1,1,N], window > seqlen, non-contig)
+python tests/test_varlen_edge_cases.py
+
+# 3. Oracle against upstream Dao-AILab flash-attention (skips if not importable)
+python tests/test_varlen_vs_flash_attn.py
+```
+
+All three exit 0 on success. The correctness test is the primary gate — the
+equal-length equivalence case (packed-equal-length varlen output must match
+batched kernel output in fp32 cos_sim > 0.99999) is the single tightest
+diagnostic for kernel bugs.

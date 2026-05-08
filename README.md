@@ -198,6 +198,42 @@ out = model(input_ids)
 work around the upstream `KeyError: 'flash_attn'` bug
 ([details](docs/integration.md#transformers-554-keyerror-workaround)).
 
+## Variable-length (packed) sequences
+
+For mixed-length training (chat, code, packed pretrain), `flash_attn_gqa_varlen`
+takes a packed stream of tokens and a cu_seqlens offset tensor — no padding,
+so attention cost scales with real tokens instead of `B * max_seqlen`. FA2-
+compatible API.
+
+```python
+import torch
+from gemma_triton_flash_attn import flash_attn_gqa_varlen
+
+seqlens = torch.tensor([512, 1024, 256, 2048])                        # 4 samples
+cu = torch.zeros(5, dtype=torch.int32, device="cuda")
+cu[1:] = seqlens.cumsum(0).to(torch.int32).cuda()
+total = int(seqlens.sum())
+max_len = int(seqlens.max())
+
+q = torch.randn(total, 8, 128, dtype=torch.bfloat16, device="cuda")   # (tokens, H_Q, D)
+k = torch.randn(total, 2, 128, dtype=torch.bfloat16, device="cuda")   # (tokens, H_KV, D)
+v = torch.randn(total, 2, 128, dtype=torch.bfloat16, device="cuda")
+
+out = flash_attn_gqa_varlen(q, k, v, cu, cu, max_len, max_len,
+                            causal=True, window_size=0)               # or window_size=1024 for SWA
+```
+
+Measured on H200 (Zipf-distributed lengths, Triton 3.2):
+
+| D | GQA | total | pad% | varlen speedup vs padded-batched |
+|--:|:---:|------:|-----:|----------------------------------:|
+| 128 | 8:1 | 32K | 93% | **24.76×** |
+| 128 | 32:4 | 16K | 87% | 12.52× |
+| 256 | 8:2 | 8K | 76% | **5.04×** |
+| 512 | 32:4 | 4K | 58% | **3.27×** |
+
+See [`docs/varlen.md`](docs/varlen.md) for full API and design notes.
+
 ## Why this package
 
 PyTorch SDPA (cuDNN / FlashAttention-3) is heavily optimised for standard
@@ -254,7 +290,6 @@ Full test matrix and expected outputs: [`docs/tests.md`](docs/tests.md).
 
 ## What it does NOT support
 
-- Variable-length sequences / padding mask
 - ALiBi or positional bias injection
 - `softcap` (raises `NotImplementedError` in the adapter)
 - Attention dropout

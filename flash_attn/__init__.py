@@ -39,6 +39,12 @@ from .attention import (
     attention_flash_gqa,
     flash_attn_gqa_train,
     FlashAttnGQAFunction,
+    # Varlen (packed cu_seqlens) API
+    flash_attn_gqa_varlen,
+    FlashAttnGQAVarlenFunction,
+    attention_gqa_varlen_ref,
+    pack_batched_to_varlen,
+    unpack_varlen_to_batched,
     # Reference implementations
     attention_gqa_ref,
     attention_swa_ref,
@@ -60,6 +66,12 @@ __all__ = [
     "attention_flash_gqa",
     "flash_attn_gqa_train",
     "FlashAttnGQAFunction",
+    # Varlen API
+    "flash_attn_gqa_varlen",
+    "FlashAttnGQAVarlenFunction",
+    "attention_gqa_varlen_ref",
+    "pack_batched_to_varlen",
+    "unpack_varlen_to_batched",
     "attention_gqa_ref",
     "attention_swa_ref",
     "attention",
