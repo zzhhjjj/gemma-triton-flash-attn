@@ -54,7 +54,14 @@ from .attention import (
 # HuggingFace transformers integration
 from .hf_integration import (
     register_triton_attention,
+    register_triton_attention_ulysses,
+    register_triton_attention_varlen,
+    register_triton_attention_varlen_ulysses,
     triton_gqa_attention,
+    triton_gqa_varlen_attention,
+    set_varlen_cu_seqlens,
+    clear_varlen_cu_seqlens,
+    cu_seqlens_from_2d_indices,
     patch_transformers_5_5_4_flash_attn_key,
     patch_gemma4_shared_kv_states_for_fsdp2,
     patch_gemma4_image_group_ids_for_kernel,
@@ -77,6 +84,7 @@ __all__ = [
     "attention",
     # HF transformers integration
     "register_triton_attention",
+    "register_triton_attention_ulysses",
     "triton_gqa_attention",
     "patch_transformers_5_5_4_flash_attn_key",
     "patch_gemma4_shared_kv_states_for_fsdp2",

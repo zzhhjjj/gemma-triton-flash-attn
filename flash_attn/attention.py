@@ -1572,9 +1572,9 @@ def _flash_attn_gqa_bwd_dkv_kernel(
     dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
     dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
     if ATOMIC_REDUCE:
-        # Atomic fuse into shared dK/dV, avoiding expand+reduce pass.
-        tl.atomic_add(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
-        tl.atomic_add(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+        # Triton 3.6: atomic_add doesn't support bf16. Caller provides fp32 buffers.
+        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
     else:
         tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
         tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
@@ -1758,9 +1758,9 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
     dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
     if Q_SPLITS > 1:
-        # Caller pre-zeroed dK/dV; multiple programs contribute via atomic_add.
-        tl.atomic_add(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
-        tl.atomic_add(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+        # Triton 3.6: atomic_add doesn't support bf16. Caller provides fp32 buffers.
+        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
     else:
         # Direct store — only this program writes this tile.
         tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
@@ -1925,8 +1925,10 @@ def _flash_attn_gqa_varlen_bwd_dkv_packed_kernel(
     dk_ptrs = dk_h_base + kv_global[:, None] * stride_dkt + d_range[None, :] * stride_dkd
     dv_ptrs = dv_h_base + kv_global[:, None] * stride_dvt + d_range[None, :] * stride_dvd
     if Q_SPLITS > 1:
-        tl.atomic_add(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
-        tl.atomic_add(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+        # Triton 3.6: atomic_add does not support bf16. dk_acc/dv_acc are fp32;
+        # when Q_SPLITS > 1 the caller allocates dK/dV as fp32 buffers.
+        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
     else:
         tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
         tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
@@ -2345,8 +2347,8 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # allocator call + 1 cudaMemsetAsync for the QS>1 path. Tiny (~5μs) but
         # free since semantically identical.
         if Q_SPLITS_DKV > 1:
-            dkv = torch.empty((2,) + k.shape, dtype=k.dtype, device=k.device)
-            dkv.zero_()
+            # Triton 3.6 atomic_add doesn't support bf16 — accumulate in fp32
+            dkv = torch.zeros((2,) + k.shape, dtype=torch.float32, device=k.device)
             dk, dv = dkv[0], dkv[1]
         else:
             dk = torch.empty_like(k)
@@ -2374,6 +2376,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             HAS_GROUP_IDS=has_group_ids,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
+
+        if Q_SPLITS_DKV > 1:
+            dk = dk.to(k.dtype)
+            dv = dv.to(v.dtype)
 
         return dq, dk, dv, None, None, None, None, None
 
@@ -2553,8 +2559,8 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         grid_dkv = (triton.cdiv(max_seqlen_k, BLOCK_KV_DKV), B * H_KV, Q_SPLITS_DKV)
 
         if Q_SPLITS_DKV > 1:
-            dkv = torch.empty((2,) + k.shape, dtype=k.dtype, device=k.device)
-            dkv.zero_()
+            # Triton 3.6 atomic_add doesn't support bf16 — accumulate in fp32
+            dkv = torch.zeros((2,) + k.shape, dtype=torch.float32, device=k.device)
             dk, dv = dkv[0], dkv[1]
         else:
             dk = torch.empty_like(k)
@@ -2580,8 +2586,10 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
-        # Return one None for each non-tensor forward arg:
-        #   (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, window_size)
+        if Q_SPLITS_DKV > 1:
+            dk = dk.to(k.dtype)
+            dv = dv.to(v.dtype)
+
         return dq, dk, dv, None, None, None, None, None, None
 
 
