@@ -3,6 +3,15 @@ import triton
 import triton.language as tl
 import math
 
+# Small-SMEM GPUs (e.g. RTX PRO 6000 Blackwell: 99KB/block vs H100's 228KB) can't
+# hold the H100-tuned tile configs. Detect once and shrink blocks at every launch
+# site — same math, smaller tiles.
+try:
+    _SMEM_LIM = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+except Exception:
+    _SMEM_LIM = 1 << 20
+_SMALL_SMEM = _SMEM_LIM < 140 * 1024
+
 
 # =====================================================================
 # PyTorch reference: scaled dot-product attention
@@ -621,9 +630,9 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     #   D<256:                        (BQ=128, BKV=64) — same as D=256
     # num_warps=8 for D>=256 (large tiles need many warps to hide latency).
     if BLOCK_Q is None:
-        BLOCK_Q = 64 if D >= 512 else 128
+        BLOCK_Q = (32 if D >= 512 else 64) if _SMALL_SMEM else (64 if D >= 512 else 128)
     if BLOCK_KV is None:
-        BLOCK_KV = 32 if D >= 512 else 64
+        BLOCK_KV = (16 if D >= 512 else 32) if _SMALL_SMEM else (32 if D >= 512 else 64)
     if BLOCK_D is None:
         BLOCK_D = D  # no D-tiling: single tl.dot per KV tile
     if num_warps is None:
@@ -1567,11 +1576,15 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= N:
             slide_size = 0
 
-        BLOCK_Q = 64 if D >= 512 else 128
-        BLOCK_KV = 32 if D >= 512 else 64
+        if _SMALL_SMEM:
+            BLOCK_Q = 32 if D >= 512 else 64
+            BLOCK_KV = 16 if D >= 512 else 32
+        else:
+            BLOCK_Q = 64 if D >= 512 else 128
+            BLOCK_KV = 32 if D >= 512 else 64
         BLOCK_D = D
         num_warps = 8 if D >= 256 else 4
-        num_stages = 2
+        num_stages = 1 if _SMALL_SMEM else 2
         BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
         BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
         grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
@@ -1636,7 +1649,9 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # D-specific tuning (sweeps in context/baseline.md):
         #   D=512: (BQ=32, BKV=64, w=8)  — register-constrained, need 8 warps
         #   D=256: (BQ=64, BKV=64, w=4)  — more headroom, larger BQ + fewer warps win
-        if D >= 512:
+        if _SMALL_SMEM:
+            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = (16, 16, 4) if D >= 512 else (32, 32, 4)
+        elif D >= 512:
             BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
         else:
             BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
@@ -1677,7 +1692,12 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         #
         # The old split path (_flash_attn_gqa_bwd_dkv_kernel with expand+reduce)
         # is kept in the source for reference but no longer on the hot path.
-        if D >= 512:
+        if _SMALL_SMEM:
+            # 99KB budget: fp32 dk/dv accumulators dominate (BKV*D*4 each);
+            # keep BKV=16 and shrink BQ so q/do tiles fit alongside.
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = (16, 16, 4) if D >= 512 else (16, 32, 4)
+            num_stages_dkv = 1
+        elif D >= 512:
             # Pack-GQA sweep @ N=4K Gemma4 (H_Q=32,H_KV=4): (BKV=16,BQ=64,w=4)
             # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
             # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64

@@ -11,6 +11,34 @@ Covers both **Gemma-4-E2B (dense)** and **Gemma-4-26B-A4B (MoE)** attention
 shapes — the MoE router is upstream of attention, so the kernel sees the
 same Q/K/V tensors and only the head counts / window size differ.
 
+## Small-SMEM GPU support (workstation Blackwell, SM120) + ms-swift integration
+
+The default tile configs are tuned for H100's **228KB** shared memory per
+block; workstation Blackwell cards (RTX PRO 6000 / RTX 5090 class, SM120) only
+have **99KB**, and the stock D=512 config needs 144KB → compile-time
+`OutOfResources`. This adds:
+
+- **`_SMALL_SMEM` auto-detection** in `flash_attn/attention.py`: GPUs with
+  <140KB SMEM/block get shrunken tile configs at all four launch sites
+  (fwd ×2, bwd dq, bwd dkv). Same math, smaller tiles. H100+ is unaffected.
+- **ms-swift integration**: `integrations/ms_swift/triton_attn_patch.py` +
+  guide in [`docs/ms-swift-integration.md`](docs/ms-swift-integration.md) —
+  one `--custom_register_path` flag routes all Gemma-4 attention through the
+  kernel (handles the `flash_attn` wheel name collision).
+
+Measured on RTX PRO 6000 Blackwell (SM120, 99KB, bf16), gemma-4-12B:
+
+| Benchmark | Triton | SDPA | Speedup |
+|---|---|---|---|
+| Kernel fwd+bwd, D=512 full causal, N=4K | 30.9ms | 79.1ms | **2.6×** |
+| Kernel fwd+bwd, D=256 SWA(1024), N=4K | 4.2ms | 39.1ms | **9.2×** |
+| **E2E DPO training** (LoRA r64, max_len 8192, step-aligned) | 8m03s/34 steps | 11m51s/34 steps | **1.47×** |
+
+Correctness on this card: fwd |Δ|≤0.008, grads |Δ|≤0.031 vs SDPA; training
+step-1 loss identical (0.8197). Bonus: SDPA's D=512 math path materialises an
+fp32 N×N score tensor (8 GiB at N=8192) — the flash-style kernel eliminates
+that spike entirely, fixing our real-world training OOM.
+
 ## Results at a glance (H100, single GPU)
 
 | Benchmark | Config | Peak speedup / saving |
