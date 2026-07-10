@@ -12,6 +12,7 @@
 | `2026-04-17_q-split-dkv.md` | dKV pack-GQA kernel Q_SPLIT + atomic_add 回收 SM occupancy；gate 在 raw_grid < 256 才开，目标 2-wave on 132 SMs |
 | `2026-04-17_grid-gate-over-n-gate.md` | Block-config gate 应该基于 raw_grid 不是 N 单维；H_KV/B 同样影响 grid，误推广旧结论就会埋雷 (Config A 短 N BKV=32 碎片 4 月误用案例) |
 | `2026-04-17_alloc-not-bottleneck.md` | training bwd 的 alloc 只占 3-5%（caching allocator 很快），别优化；autograd.Function 框架 80μs CPU-exclusive 才是 short-N 剩余瓶颈 |
+| `2026-07-10_small-smem-workstation-gpu.md` | 99KB SMEM 工作站卡（Blackwell SM120）适配：`_SMALL_SMEM` 自动缩块四处 launch；实测 2.6×/9.2×、根治 SDPA math-path 8GB OOM；含 ms-swift 集成踩坑（flash_attn 包名冲突） |
 
 ---
 
