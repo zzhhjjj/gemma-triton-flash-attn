@@ -273,6 +273,13 @@ def _flash_attn_gqa_kernel(
     GroupHi_ptr,
     stride_gb, stride_gn,
     HAS_GROUP_IDS: tl.constexpr,
+    # Packed-document isolation (text packing). DocLo[b, n] = start index of
+    # token n's document; kv < DocLo(q) is masked so causal attention never
+    # crosses a packed-document boundary (FA varlen cu_seqlens equivalent).
+    # Constant-folded away when HAS_DOC_MASK=False.
+    DocLo_ptr,
+    stride_docb, stride_docn,
+    HAS_DOC_MASK: tl.constexpr,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_Q), B * N_Q_HEADS)
     q_block_idx = tl.program_id(0)
@@ -309,6 +316,12 @@ def _flash_attn_gqa_kernel(
         block_img_lo = tl.min(q_group_lo, axis=0)
         block_img_hi = tl.max(q_group_hi, axis=0)
 
+    # Per-token document start for packed-doc isolation.
+    if HAS_DOC_MASK:
+        dlo_base = DocLo_ptr + b_idx * stride_docb
+        q_doc_lo = tl.load(dlo_base + q_offsets * stride_docn, mask=q_mask, other=0)
+        block_doc_lo = tl.min(q_doc_lo, axis=0)
+
     # Determine KV iteration range.
     if IS_CAUSAL:
         kv_end = (q_block_idx + 1) * BLOCK_Q
@@ -328,6 +341,12 @@ def _flash_attn_gqa_kernel(
         kv_loop_start = tl.minimum(kv_loop_start, (block_img_lo // BLOCK_KV) * BLOCK_KV)
         kv_end = tl.maximum(kv_end, block_img_hi)
 
+    # No token attends before its document start: skip whole KV tiles below
+    # the block's earliest doc start. This is where packed short docs keep
+    # their FLOPs advantage (compute scales with doc length, not SEQ_LEN).
+    if HAS_DOC_MASK and IS_CAUSAL:
+        kv_loop_start = tl.maximum(kv_loop_start, (block_doc_lo // BLOCK_KV) * BLOCK_KV)
+
     LOG2E: tl.constexpr = 1.4426950408889634
     scale_log2e = scale * LOG2E
 
@@ -343,7 +362,7 @@ def _flash_attn_gqa_kernel(
     # When HAS_GROUP_IDS, every tile may need an OR-mask check, so the unmasked
     # phase optimization is unsafe — disable it.
     USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)
-    if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT and not HAS_GROUP_IDS:
+    if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT and not HAS_GROUP_IDS and not HAS_DOC_MASK:
         kv_end_unmasked = (q_block_idx * BLOCK_Q) // BLOCK_KV * BLOCK_KV
     else:
         kv_end_unmasked = kv_loop_start  # skip unmasked phase
@@ -400,13 +419,17 @@ def _flash_attn_gqa_kernel(
             bidir = (q_group_ids[:, None] == kv_group_ids[None, :]) & \
                     (q_group_ids[:, None] >= 0) & kv_mask[None, :]
             valid = valid | bidir
+        if HAS_DOC_MASK:
+            valid = valid & (kv_offsets[None, :] >= q_doc_lo[:, None])
         scores = tl.where(valid, scores, -float("inf"))
 
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(m_i, block_max)
         # SWA may produce all-masked rows (no key visible); HAS_GROUP_IDS
-        # implies SWA path and inherits the same NaN-clamp safeguard.
-        if SLIDE_SIZE > 0:
+        # implies SWA path and inherits the same NaN-clamp safeguard. Doc-mask
+        # KV tiles that lie entirely before a row's document start are
+        # all-masked too, so they need the same clamp.
+        if SLIDE_SIZE > 0 or HAS_DOC_MASK:
             safe_new = tl.maximum(new_max, -1e20)
             alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
             p = tl.math.exp2(scores - safe_new[:, None])
@@ -620,8 +643,13 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     #   D=256 (Gemma4 sliding attn):  (BQ=128, BKV=64) — more headroom, larger blocks win
     #   D<256:                        (BQ=128, BKV=64) — same as D=256
     # num_warps=8 for D>=256 (large tiles need many warps to hide latency).
+    # sm_100+ (B200/B300, 227KB smem/SM): the H100-tuned tiles overflow shared
+    # memory (~274KB) and BQ=64@D=512 additionally hits a misaligned-address
+    # miscompile on sm_103a; halve BLOCK_Q (sweep 2026-07-09 on B300 sm_103a:
+    # D=512 (32,32) 2.73ms, D=256 (64,64) 0.25ms @ N=4096).
+    _sm100 = torch.cuda.get_device_capability()[0] >= 10
     if BLOCK_Q is None:
-        BLOCK_Q = 64 if D >= 512 else 128
+        BLOCK_Q = (32 if _sm100 else 64) if D >= 512 else (64 if _sm100 else 128)
     if BLOCK_KV is None:
         BLOCK_KV = 32 if D >= 512 else 64
     if BLOCK_D is None:
@@ -665,6 +693,8 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
         GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
         stride_gb=g_strides[0], stride_gn=g_strides[1],
         HAS_GROUP_IDS=has_group_ids,
+        DocLo_ptr=None, stride_docb=0, stride_docn=0,
+        HAS_DOC_MASK=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -776,6 +806,10 @@ def _flash_attn_gqa_bwd_dq_kernel(
     GroupHi_ptr,
     stride_gb, stride_gn,
     HAS_GROUP_IDS: tl.constexpr,
+    # Packed-document isolation (mirror of fwd kernel).
+    DocLo_ptr,
+    stride_docb, stride_docn,
+    HAS_DOC_MASK: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     bh_idx = tl.program_id(1)
@@ -841,6 +875,14 @@ def _flash_attn_gqa_bwd_dq_kernel(
         kv_loop_start = tl.minimum(kv_loop_start, (block_img_lo // BLOCK_KV) * BLOCK_KV)
         kv_end = tl.maximum(kv_end, block_img_hi)
 
+    # Packed-doc isolation: per-token doc start + KV tile skip (mirror of fwd).
+    if HAS_DOC_MASK:
+        dlo_base = DocLo_ptr + b_idx * stride_docb
+        q_doc_lo = tl.load(dlo_base + q_offsets * stride_docn, mask=q_mask, other=0)
+        if IS_CAUSAL:
+            block_doc_lo = tl.min(q_doc_lo, axis=0)
+            kv_loop_start = tl.maximum(kv_loop_start, (block_doc_lo // BLOCK_KV) * BLOCK_KV)
+
     dq_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
 
     # Convert LSE to log2 domain once so we can use tl.math.exp2 inside the loop.
@@ -873,6 +915,8 @@ def _flash_attn_gqa_bwd_dq_kernel(
             bidir = (q_group_ids[:, None] == kv_group_ids[None, :]) & \
                     (q_group_ids[:, None] >= 0) & kv_mask[None, :]
             valid = valid | bidir
+        if HAS_DOC_MASK:
+            valid = valid & (kv_offsets[None, :] >= q_doc_lo[:, None])
         scores = tl.where(valid, scores, -float("inf"))
         p = tl.math.exp2(scores - lse_log2[:, None])
 
@@ -1196,6 +1240,12 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     GroupHi_ptr,
     stride_gb, stride_gn,
     HAS_GROUP_IDS: tl.constexpr,
+    # Packed-document isolation. KV-major iteration needs the KV side of the
+    # bound: DocHi[b, n] = end (exclusive) of token n's document; q >= DocHi(kv)
+    # is masked, and the Q loop is clamped to the tile's furthest doc end.
+    DocHi_ptr,
+    stride_docb, stride_docn,
+    HAS_DOC_MASK: tl.constexpr,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS)
     kv_block_idx = tl.program_id(0)
@@ -1261,6 +1311,13 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
         q_loop_end = tl.maximum(q_loop_end, block_img_hi)
         # q_loop_end may exceed SEQ_LEN at the tail; mask handles it inside loop.
 
+    # Packed-doc isolation: no query outside this KV tile's documents can
+    # attend to it, so the Q loop stops at the tile's furthest doc end.
+    if HAS_DOC_MASK:
+        dhi_base = DocHi_ptr + b_idx * stride_docb
+        kv_doc_hi = tl.load(dhi_base + kv_offsets * stride_docn, mask=kv_mask, other=0)
+        q_loop_end = tl.minimum(q_loop_end, tl.max(kv_doc_hi, axis=0))
+
     # Q-split: each of Q_SPLITS programs handles a disjoint slice of Q blocks.
     # Activated when raw grid << 132 SMs (e.g. H_KV=1 short N). Atomic_add on
     # dK/dV (caller pre-zeroed) replaces direct store.
@@ -1313,6 +1370,8 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
                         (q_group_ids[:, None] >= 0) & \
                         kv_mask[None, :] & q_mask_local[:, None]
                 valid = valid | bidir
+            if HAS_DOC_MASK:
+                valid = valid & (q_offsets[:, None] < kv_doc_hi[None, :])
             scores = tl.where(valid, scores, -float("inf"))
             p = tl.math.exp2(scores - lse_log2[:, None])
 
@@ -1557,7 +1616,8 @@ def _flash_attn_gqa_bwd_dk_only_kernel(
 
 class FlashAttnGQAFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl):
+    def forward(ctx, q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
+                doc_lo, doc_hi_excl):
         B, H_Q, N, D = q.shape
         _, H_KV, _, _ = k.shape
         output = torch.empty_like(q)
@@ -1567,7 +1627,9 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= N:
             slide_size = 0
 
-        BLOCK_Q = 64 if D >= 512 else 128
+        # sm_100+ tile downsizing — see attention_flash_gqa for the rationale.
+        _sm100 = torch.cuda.get_device_capability()[0] >= 10
+        BLOCK_Q = (32 if _sm100 else 64) if D >= 512 else (64 if _sm100 else 128)
         BLOCK_KV = 32 if D >= 512 else 64
         BLOCK_D = D
         num_warps = 8 if D >= 256 else 4
@@ -1582,6 +1644,14 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             g_strides = (group_ids.stride(0), group_ids.stride(1))
         else:
             g_strides = (0, 0)
+
+        has_doc_mask = doc_lo is not None
+        if has_doc_mask:
+            assert doc_hi_excl is not None, "doc_lo requires doc_hi_excl"
+            assert causal, "doc masking assumes causal attention (packed docs)"
+            doc_strides = (doc_lo.stride(0), doc_lo.stride(1))
+        else:
+            doc_strides = (0, 0)
 
         _flash_attn_gqa_kernel[grid](
             q, k, v, output,
@@ -1599,24 +1669,33 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides[0], stride_gn=g_strides[1],
             HAS_GROUP_IDS=has_group_ids,
+            DocLo_ptr=doc_lo, stride_docb=doc_strides[0], stride_docn=doc_strides[1],
+            HAS_DOC_MASK=has_doc_mask,
             num_warps=num_warps, num_stages=num_stages,
         )
 
         # save_for_backward supports None entries (kept as None in saved_tensors).
-        ctx.save_for_backward(q, k, v, output, lse, group_ids, group_lo, group_hi_excl)
+        ctx.save_for_backward(q, k, v, output, lse, group_ids, group_lo, group_hi_excl,
+                              doc_lo, doc_hi_excl)
         ctx.causal = causal
         ctx.slide_size = slide_size
         ctx.has_group_ids = has_group_ids
+        ctx.has_doc_mask = has_doc_mask
         return output
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, lse, group_ids, group_lo, group_hi_excl = ctx.saved_tensors
+        (q, k, v, o, lse, group_ids, group_lo, group_hi_excl,
+         doc_lo, doc_hi_excl) = ctx.saved_tensors
         causal = ctx.causal
         slide_size = ctx.slide_size
         has_group_ids = ctx.has_group_ids
+        has_doc_mask = ctx.has_doc_mask
         g_strides_dq = (
             (group_ids.stride(0), group_ids.stride(1)) if has_group_ids else (0, 0)
+        )
+        doc_strides = (
+            (doc_lo.stride(0), doc_lo.stride(1)) if has_doc_mask else (0, 0)
         )
         B, H_Q, N, D = q.shape
         _, H_KV, _, _ = k.shape
@@ -1663,6 +1742,8 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
+            DocLo_ptr=doc_lo, stride_docb=doc_strides[0], stride_docn=doc_strides[1],
+            HAS_DOC_MASK=has_doc_mask,
             num_warps=num_warps_bw, num_stages=2,
         )
 
@@ -1763,14 +1844,17 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
+            DocHi_ptr=doc_hi_excl, stride_docb=doc_strides[0], stride_docn=doc_strides[1],
+            HAS_DOC_MASK=has_doc_mask,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
-                         group_ids=None, group_lo=None, group_hi_excl=None):
+                         group_ids=None, group_lo=None, group_hi_excl=None,
+                         doc_lo=None, doc_hi_excl=None):
     """Flash Attention GQA with backward pass support for training.
 
     Args:
@@ -1782,10 +1866,49 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
         group_ids / group_lo / group_hi_excl: optional (B, N) int32 tensors
             enabling the image-bidirectional OR-mask path for Gemma-4
             multimodal training. See `attention_flash_gqa` for semantics.
+        doc_lo / doc_hi_excl: optional (B, N) int32 tensors enabling
+            packed-document isolation (`packing` training): token n belongs to
+            the document spanning [doc_lo[b, n], doc_hi_excl[b, n]) and never
+            attends outside it. Derive from packed position_ids with
+            `doc_bounds_from_position_ids`. Requires causal=True; composable
+            with slide_size, currently exclusive with group_ids.
     """
+    if doc_lo is not None:
+        assert causal, "doc masking requires causal=True (packed documents)"
+        assert group_ids is None, \
+            "doc masking + image groups not supported yet (packed multimodal)"
     return FlashAttnGQAFunction.apply(
         q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
+        doc_lo, doc_hi_excl,
     )
+
+
+def doc_bounds_from_position_ids(position_ids):
+    """Derive packed-document bounds for `flash_attn_gqa_train` doc masking.
+
+    Args:
+        position_ids: (B, N) int tensor that resets to 0 at each packed
+            document start (the convention used by transformers / ms-swift
+            padding-free packing).
+
+    Returns:
+        (doc_lo, doc_hi_excl): (B, N) int32 contiguous tensors; token n's
+        document spans [doc_lo[b, n], doc_hi_excl[b, n]).
+    """
+    pos = position_ids.to(torch.int32)
+    B, N = pos.shape
+    idx = torch.arange(N, device=pos.device, dtype=torch.int32)
+    # Documents are contiguous and position ids count from 0 within each doc.
+    doc_lo = idx.unsqueeze(0) - pos
+    # doc_hi_excl(n) = the first document start strictly after n (or N).
+    is_start = pos == 0
+    start_idx = torch.where(is_start, idx.expand(B, N), torch.full_like(pos, N))
+    next_start_incl = torch.flip(
+        torch.cummin(torch.flip(start_idx, dims=[-1]), dim=-1).values, dims=[-1])
+    doc_hi_excl = torch.cat(
+        [next_start_incl[:, 1:],
+         torch.full((B, 1), N, device=pos.device, dtype=torch.int32)], dim=1)
+    return doc_lo.contiguous(), doc_hi_excl.contiguous()
 
 
 # --- Benchmark ---

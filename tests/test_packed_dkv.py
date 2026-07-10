@@ -32,7 +32,10 @@ def run_forward_with_lse(q, k, v, *, causal, slide_size):
     _, H_KV, _, _ = k.shape
     if slide_size > 0 and slide_size >= N:
         slide_size = 0
-    BQ = min(64 if D >= 512 else 128, triton.next_power_of_2(N))
+    # sm_100+ needs smaller tiles (227KB smem/SM) — mirror the wrapper defaults.
+    _sm100 = torch.cuda.get_device_capability()[0] >= 10
+    BQ = min((32 if _sm100 else 64) if D >= 512 else (64 if _sm100 else 128),
+             triton.next_power_of_2(N))
     BKV = min(32 if D >= 512 else 64, triton.next_power_of_2(N))
     num_warps = 8 if D >= 256 else 4
     output = torch.empty_like(q)
@@ -51,6 +54,7 @@ def run_forward_with_lse(q, k, v, *, causal, slide_size):
         stride_lsen=lse.stride(2), STORE_LSE=True,
         GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
         stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
+        DocLo_ptr=None, stride_docb=0, stride_docn=0, HAS_DOC_MASK=False,
         num_warps=num_warps, num_stages=2,
     )
     return output, lse, slide_size
@@ -152,6 +156,7 @@ def run_dkv_packed(q, k, v, do, lse, delta, *, causal, slide_size,
         Q_SPLITS=1,
         GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
         stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
+        DocHi_ptr=None, stride_docb=0, stride_docn=0, HAS_DOC_MASK=False,
         num_warps=num_warps, num_stages=2,
     )
     return dk, dv
