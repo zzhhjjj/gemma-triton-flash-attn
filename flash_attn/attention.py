@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import math
+import os
 
 
 # =====================================================================
@@ -1716,7 +1717,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         #   D=512: (BQ=32, BKV=64, w=8)  — register-constrained, need 8 warps
         #   D=256: (BQ=64, BKV=64, w=4)  — more headroom, larger BQ + fewer warps win
         if D >= 512:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
+            # B300 sweep override (GTFA_DQ_*): H100-tuned defaults regress on sm103
+            BLOCK_Q_BW = int(os.getenv("GTFA_DQ_BQ", "32"))
+            BLOCK_KV_BW = int(os.getenv("GTFA_DQ_BKV", "64"))
+            num_warps_bw = int(os.getenv("GTFA_DQ_W", "8"))
         else:
             BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
         BLOCK_Q_BW = min(BLOCK_Q_BW, triton.next_power_of_2(N))
@@ -1744,7 +1748,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             HAS_GROUP_IDS=has_group_ids,
             DocLo_ptr=doc_lo, stride_docb=doc_strides[0], stride_docn=doc_strides[1],
             HAS_DOC_MASK=has_doc_mask,
-            num_warps=num_warps_bw, num_stages=2,
+            num_warps=num_warps_bw, num_stages=int(os.getenv("GTFA_DQ_ST", "2")),
         )
 
         # --- dK, dV kernel (packed: KV-major, inline GQA Q-head loop) ---
@@ -1763,8 +1767,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
             # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
             # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
-            num_stages_dkv = 2
+            BLOCK_KV_DKV = int(os.getenv("GTFA_DKV_BKV", "16"))
+            BLOCK_Q_DKV = int(os.getenv("GTFA_DKV_BQ", "64"))
+            num_warps_dkv = int(os.getenv("GTFA_DKV_W", "4"))
+            num_stages_dkv = int(os.getenv("GTFA_DKV_ST", "2"))
         else:
             # D<512: (BKV=64, BQ=128, w=8, s=1) is the big-tile config that
             # wins when grid is healthy. We use it in TWO regimes:
