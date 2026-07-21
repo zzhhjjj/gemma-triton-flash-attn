@@ -38,6 +38,7 @@ from .attention import (
     # Primary Triton kernels (public API)
     attention_flash_gqa,
     flash_attn_gqa_train,
+    doc_bounds_from_position_ids,
     FlashAttnGQAFunction,
     # Reference implementations
     attention_gqa_ref,
@@ -59,6 +60,7 @@ __version__ = "0.1.0"
 __all__ = [
     "attention_flash_gqa",
     "flash_attn_gqa_train",
+    "doc_bounds_from_position_ids",
     "FlashAttnGQAFunction",
     "attention_gqa_ref",
     "attention_swa_ref",

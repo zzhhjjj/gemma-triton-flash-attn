@@ -23,11 +23,45 @@ changes required.
 from __future__ import annotations
 
 import contextvars
+import os
 from typing import NamedTuple
 
 import torch
 
-from .attention import flash_attn_gqa_train
+_probe_seen: set = set()
+
+from .attention import doc_bounds_from_position_ids, flash_attn_gqa_train
+
+
+# =====================================================================
+# Packed-document isolation plumbing (`packing` / padding-free training)
+#
+# ms-swift / transformers packing flattens multiple documents into one row and
+# passes position_ids that reset to 0 at each document start. FA2 recovers the
+# document boundaries via cu_seqlens; our kernel takes (doc_lo, doc_hi_excl)
+# per-token bounds instead. The same position_ids tensor is passed to every
+# decoder layer within one model forward, so a single-slot cache keyed on the
+# tensor's storage collapses the derivation (and its GPU sync) to once per step.
+# =====================================================================
+
+_doc_bounds_cache = {"key": None, "value": (None, None)}
+
+
+def _packed_doc_bounds(position_ids: torch.Tensor):
+    """Return (doc_lo, doc_hi_excl) if position_ids indicate packed documents,
+    else (None, None). Cached across layers of the same forward pass."""
+    key = (position_ids.data_ptr(), position_ids.shape[-1], position_ids._version)
+    if _doc_bounds_cache["key"] == key:
+        return _doc_bounds_cache["value"]
+    pos = position_ids if position_ids.dim() == 2 else position_ids.reshape(1, -1)
+    # Packed iff position ids restart mid-row: more zeros than rows.
+    if bool((pos == 0).sum() > pos.shape[0]):
+        value = doc_bounds_from_position_ids(pos)
+    else:
+        value = (None, None)
+    _doc_bounds_cache["key"] = key
+    _doc_bounds_cache["value"] = value
+    return value
 
 
 # =====================================================================
@@ -129,6 +163,22 @@ def triton_gqa_attention(
     Raises NotImplementedError for features the kernel doesn't support
     (softcap, nonzero dropout) — fail loudly rather than produce wrong numerics.
     """
+    if os.environ.get("GTFA_SHAPE_PROBE") == "1" and os.environ.get("RANK", "0") == "0":
+        sig = (tuple(query.shape), tuple(key.shape), tuple(value.shape), sliding_window,
+               key.data_ptr() == value.data_ptr(), scaling)
+        if sig not in _probe_seen:
+            _probe_seen.add(sig)
+            pos = kwargs.get("position_ids")
+            ndocs = None
+            pos_shape = tuple(pos.shape) if pos is not None else None
+            if pos is not None and pos.shape[-1] == query.shape[2]:
+                ndocs = int((pos[..., 1:] <= pos[..., :-1]).sum().item()) + 1
+            print(f"[GTFA-probe] position_ids shape={pos_shape} kwargs={sorted(kwargs.keys())}", flush=True)
+            print(f"[GTFA-probe] q{tuple(query.shape)} k{tuple(key.shape)} v{tuple(value.shape)} "
+                  f"win={sliding_window} k_is_v={key.data_ptr() == value.data_ptr()} "
+                  f"scaling={scaling} ndocs={ndocs}",
+                  flush=True)
+
     # Reconcile scaling. Our kernel bakes in 1/sqrt(D) internally. If the module
     # passes a different `scaling` (e.g., Gemma4 passes 1.0 because scaling is
     # folded into q_norm), pre-multiply q to cancel the kernel's internal scale.
@@ -154,10 +204,29 @@ def triton_gqa_attention(
     group_state = _image_group_state.get()
     use_image_groups = (group_state is not None) and (slide > 0) and is_causal
 
+    # Packed-document isolation: recover doc bounds from packed position_ids
+    # (reset to 0 at each doc start) so causal attention never crosses packed
+    # document boundaries — the kernel-side equivalent of FA varlen cu_seqlens.
+    doc_lo = doc_hi_excl = None
+    pos_structure_known = False
+    position_ids = kwargs.get("position_ids")
+    if position_ids is not None and is_causal and position_ids.shape[-1] == query.shape[2]:
+        doc_lo, doc_hi_excl = _packed_doc_bounds(position_ids)
+        # position_ids were readable: doc_lo=None here means a single monotonic
+        # sequence, for which a BlockMask/4D mask is plain causal(+window) and
+        # the kernel's native masking is equivalent — no need to fail below.
+        pos_structure_known = True
+    if doc_lo is not None and use_image_groups:
+        raise NotImplementedError(
+            "triton_gqa_attention: packed documents + image-bidirectional groups "
+            "(packed multimodal) is not supported yet")
+
     # Defensive guard: if the caller passed a 4D / BlockMask but no group
     # state is in context, image bidirectional info would be silently
-    # dropped — fail loudly so the user installs the patch.
-    if (group_state is None) and (attention_mask is not None) and slide > 0 and is_causal:
+    # dropped — fail loudly so the user installs the patch. Packed-doc inputs
+    # are exempt: the doc bounds fully reproduce the mask's structure.
+    if (group_state is None) and (doc_lo is None) and not pos_structure_known \
+            and (attention_mask is not None) and slide > 0 and is_causal:
         is_4d = isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
         from torch.nn.attention.flex_attention import BlockMask
         is_blockmask = isinstance(attention_mask, BlockMask)
@@ -195,6 +264,7 @@ def triton_gqa_attention(
             group_ids=group_args[0],
             group_lo=group_args[1],
             group_hi_excl=group_args[2],
+            doc_lo=doc_lo, doc_hi_excl=doc_hi_excl,
         )
     out = out.transpose(1, 2).contiguous()
     return out, None  # (attn_output, attn_weights)
