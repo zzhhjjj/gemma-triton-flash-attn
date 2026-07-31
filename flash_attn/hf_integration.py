@@ -212,6 +212,260 @@ def register_triton_attention(name: str = "triton_gqa") -> None:
     ALL_ATTENTION_FUNCTIONS[name] = triton_gqa_attention
 
 
+def register_triton_attention_ulysses(
+    cp_group, name: str = "triton_gqa_ulysses"
+) -> None:
+    """Register a Ulysses-context-parallel variant of triton_gqa.
+
+    Wraps each attention call with an all-to-all that scatters head dim and
+    gathers seq dim across `cp_group`, runs local attention on the full seq
+    with a head-shard, then inverts the all-to-all.
+    """
+    import os as _os
+
+    import torch.distributed as _dist
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    from .cp_comm import SeqAllToAll4D
+
+    _seen = {"n": 0}
+
+    def _ulysses_wrapped(module, query, key, value, attention_mask=None, **kwargs):
+        _seen["n"] += 1
+        n = _seen["n"]
+        if n <= 6 and _os.environ.get("CP_DEBUG", "0") == "1":
+            if not _dist.is_initialized() or _dist.get_rank() == 0:
+                print(
+                    f"[CP_DBG][rank0] ulysses_wrapped #{n} entry "
+                    f"q={tuple(query.shape)} k={tuple(key.shape)} v={tuple(value.shape)} "
+                    f"slide={kwargs.get('sliding_window', None)}",
+                    flush=True,
+                )
+        # GQA + Ulysses: when num_kv_heads < cp_size, replicate K/V to match
+        # Q heads before the all-to-all (avoids empty NCCL chunks).
+        cp_size = _dist.get_world_size(cp_group)
+        h_q = query.shape[1]
+        h_kv = key.shape[1]
+        if h_kv < cp_size:
+            kv_repeat = h_q // h_kv
+            key = key.repeat_interleave(kv_repeat, dim=1)
+            value = value.repeat_interleave(kv_repeat, dim=1)
+            if n <= 6 and _os.environ.get("CP_DEBUG", "0") == "1":
+                if not _dist.is_initialized() or _dist.get_rank() == 0:
+                    print(
+                        f"[CP_DBG][rank0] ulysses_wrapped #{n} KV-replicated "
+                        f"by {kv_repeat}x → k={tuple(key.shape)}",
+                        flush=True,
+                    )
+        # (B, H, N_local, D) -> (B, H/cp, N_full, D)
+        q = SeqAllToAll4D.apply(cp_group, query, 1, 2)
+        k = SeqAllToAll4D.apply(cp_group, key, 1, 2)
+        v = SeqAllToAll4D.apply(cp_group, value, 1, 2)
+        out, _ = triton_gqa_attention(module, q, k, v, attention_mask=None, **kwargs)
+        out = out.transpose(1, 2).contiguous()
+        out = SeqAllToAll4D.apply(cp_group, out, 2, 1)
+        out = out.transpose(1, 2).contiguous()
+        return out, None
+
+    ALL_ATTENTION_FUNCTIONS[name] = _ulysses_wrapped
+
+
+# =====================================================================
+# Varlen (packed-sequence) attention adapter
+# =====================================================================
+
+_varlen_cu_seqlens_state = {"value": None}
+
+
+def set_varlen_cu_seqlens(cu_seqlens, max_seqlen):
+    """Store cu_seqlens for the current forward pass. Called by the trainer
+    before model() when neat_packing is active. Uses module global (not
+    ContextVar) so gradient checkpointing recompute can access it."""
+    old = _varlen_cu_seqlens_state["value"]
+    _varlen_cu_seqlens_state["value"] = (cu_seqlens, max_seqlen)
+    return old
+
+
+def clear_varlen_cu_seqlens(token):
+    """Reset after forward+backward pass."""
+    _varlen_cu_seqlens_state["value"] = token
+
+
+def cu_seqlens_from_2d_indices(indices_2d):
+    """Convert LF's 2D attention_mask indices [1,1,2,2,2,0] to cu_seqlens.
+
+    Args:
+        indices_2d: (B, N) or (N,) int tensor. Non-zero values are sample IDs.
+
+    Returns:
+        cu_seqlens: int32 (num_samples+1,), total_valid: int
+    """
+    import torch
+    indices = indices_2d.squeeze(0) if indices_2d.dim() == 2 else indices_2d
+    mask = indices != 0
+    total_valid = int(mask.sum().item())
+    if total_valid == 0:
+        return torch.zeros(1, dtype=torch.int32, device=indices.device), 0
+    valid_indices = indices[mask]
+    unique_ids = valid_indices.unique(sorted=True)
+    boundaries = [0]
+    for uid in unique_ids:
+        boundaries.append(boundaries[-1] + int((valid_indices == uid).sum().item()))
+    return torch.tensor(boundaries, dtype=torch.int32, device=indices.device), total_valid
+
+
+def triton_gqa_varlen_attention(
+    module,
+    query: "torch.Tensor",
+    key: "torch.Tensor",
+    value: "torch.Tensor",
+    attention_mask: "torch.Tensor | None",
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    softcap: float | None = None,
+    sliding_window: int | None = None,
+    **kwargs,
+):
+    """Varlen attention adapter for packed sequences.
+
+    Expects cu_seqlens to be set via `set_varlen_cu_seqlens` before the model
+    forward, or extracts them from a 2D attention_mask (LF neat_packing indices).
+    Falls back to batched triton_gqa_attention if no packing info is available.
+    """
+    import torch
+    from .attention import flash_attn_gqa_varlen
+
+    state = _varlen_cu_seqlens_state["value"]
+    if state is None and attention_mask is not None and attention_mask.dim() == 2:
+        cu, total = cu_seqlens_from_2d_indices(attention_mask)
+        if total > 0:
+            max_sl = max(int(cu[i+1] - cu[i]) for i in range(cu.numel() - 1))
+            state = (cu, max_sl)
+
+    if state is None:
+        return triton_gqa_attention(module, query, key, value, attention_mask,
+                                    dropout=dropout, scaling=scaling,
+                                    softcap=softcap, sliding_window=sliding_window,
+                                    **kwargs)
+
+    cu_seqlens, max_seqlen = state
+
+    scale = scaling if scaling is not None else module.head_dim ** -0.5
+    default_scale = query.shape[-1] ** -0.5
+    if scale != default_scale:
+        query = query * (scale / default_scale)
+
+    if softcap is not None:
+        raise NotImplementedError("triton_gqa_varlen does not support softcap")
+
+    slide = int(sliding_window) if sliding_window else 0
+
+    B, H_Q, N, D = query.shape
+    _, H_KV, _, _ = key.shape
+    q_packed = query.squeeze(0).permute(1, 0, 2).contiguous()  # (N, H_Q, D)
+    k_packed = key.squeeze(0).permute(1, 0, 2).contiguous()
+    v_packed = value.squeeze(0).permute(1, 0, 2).contiguous()
+
+    # cu_seqlens already includes dummy padding sample (set by trainer)
+    with torch.cuda.device(query.device):
+        out_packed = flash_attn_gqa_varlen(
+            q_packed, k_packed, v_packed,
+            cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+            causal=getattr(module, "is_causal", True),
+            window_size=slide,
+        )
+
+    out = out_packed.permute(1, 0, 2).unsqueeze(0).contiguous()  # (1, H_Q, N, D)
+    out = out.transpose(1, 2).contiguous()  # (1, N, H_Q, D)
+    return out, None
+
+
+def register_triton_attention_varlen(name: str = "triton_gqa_varlen") -> None:
+    """Register the varlen adapter."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    ALL_ATTENTION_FUNCTIONS[name] = triton_gqa_varlen_attention
+
+
+def register_triton_attention_varlen_ulysses(
+    cp_group, name: str = "triton_gqa_varlen_ulysses"
+) -> None:
+    """Register a Ulysses CP + varlen variant.
+
+    Wraps each attention call with all-to-all (scatter heads, gather tokens),
+    runs varlen attention on the reassembled full sequence, then inverses.
+    """
+    import os as _os
+    import torch
+    import torch.distributed as _dist
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from .cp_comm import SeqAllToAll4D
+    from .attention import flash_attn_gqa_varlen
+
+    _seen = {"n": 0}
+
+    def _varlen_ulysses_wrapped(module, query, key, value, attention_mask=None, **kwargs):
+        _seen["n"] += 1
+        n = _seen["n"]
+        cp_size = _dist.get_world_size(cp_group)
+
+        scale = kwargs.get("scaling", None)
+        if scale is None:
+            scale = module.head_dim ** -0.5
+        default_scale = query.shape[-1] ** -0.5
+        if scale != default_scale:
+            query = query * (scale / default_scale)
+        kwargs.pop("scaling", None)
+
+        slide = int(kwargs.get("sliding_window", 0) or 0)
+        is_causal = getattr(module, "is_causal", True)
+
+        B, H_Q, N_local, D = query.shape
+        H_KV = key.shape[1]
+
+        # KV replication for GQA when H_KV < cp_size
+        if H_KV < cp_size:
+            kv_rep = H_Q // H_KV
+            key = key.repeat_interleave(kv_rep, dim=1)
+            value = value.repeat_interleave(kv_rep, dim=1)
+
+        # Reshape to packed: (B=1, H, N_local, D) -> (N_local, H, D)
+        q_local = query.squeeze(0).permute(1, 0, 2).contiguous()
+        k_local = key.squeeze(0).permute(1, 0, 2).contiguous()
+        v_local = value.squeeze(0).permute(1, 0, 2).contiguous()
+
+        # All-to-all: scatter heads (dim=1), gather tokens (dim=0)
+        q_full = SeqAllToAll4D.apply(cp_group, q_local, 1, 0)
+        k_full = SeqAllToAll4D.apply(cp_group, k_local, 1, 0)
+        v_full = SeqAllToAll4D.apply(cp_group, v_local, 1, 0)
+
+        # cu_seqlens from ContextVar (set by trainer, includes dummy padding sample)
+        N_full = q_full.shape[0]
+        state = _varlen_cu_seqlens_state["value"]
+        if state is not None:
+            cu_seqlens, max_seqlen = state
+        else:
+            cu_seqlens = torch.tensor([0, N_full], dtype=torch.int32, device=q_full.device)
+            max_seqlen = N_full
+
+        with torch.cuda.device(query.device):
+            out_full = flash_attn_gqa_varlen(
+                q_full.contiguous(), k_full.contiguous(), v_full.contiguous(),
+                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                causal=is_causal, window_size=slide,
+            )
+
+        # Inverse all-to-all: scatter tokens (dim=0), gather heads (dim=1)
+        out_local = SeqAllToAll4D.apply(cp_group, out_full, 0, 1)
+
+        # Reshape back to (1, H_Q, N_local, D) then (1, N_local, H_Q, D)
+        out = out_local.permute(1, 0, 2).unsqueeze(0).contiguous()
+        out = out.transpose(1, 2).contiguous()
+        return out, None
+
+    ALL_ATTENTION_FUNCTIONS[name] = _varlen_ulysses_wrapped
+
+
 def patch_transformers_5_5_4_flash_attn_key() -> None:
     """Workaround for a transformers 5.5.4 bug where loading **any** model
     raises `KeyError: 'flash_attn'` from `PACKAGE_DISTRIBUTION_MAPPING`.

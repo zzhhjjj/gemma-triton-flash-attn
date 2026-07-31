@@ -343,7 +343,7 @@ def _flash_attn_gqa_kernel(
     # When HAS_GROUP_IDS, every tile may need an OR-mask check, so the unmasked
     # phase optimization is unsafe — disable it.
     USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)
-    if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT and not HAS_GROUP_IDS:
+    if ((IS_CAUSAL and SLIDE_SIZE == 0) and USE_SPLIT) and (not HAS_GROUP_IDS):
         kv_end_unmasked = (q_block_idx * BLOCK_Q) // BLOCK_KV * BLOCK_KV
     else:
         kv_end_unmasked = kv_loop_start  # skip unmasked phase
@@ -434,6 +434,182 @@ def _flash_attn_gqa_kernel(
         LN2: tl.constexpr = 0.6931471805599453
         lse = m_i * LN2 + tl.log(l_i)
         lse_ptrs = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh + q_offsets * stride_lsen
+        tl.store(lse_ptrs, lse, mask=q_mask)
+
+
+# =====================================================================
+# Flash Attention GQA — Varlen (packed / cu_seqlens) forward kernel
+#
+# Grid: (cdiv(max_seqlen_q, BLOCK_Q), H_Q, B).
+#   program_id(0) -> q_block_idx WITHIN the sample
+#   program_id(1) -> q_h_idx
+#   program_id(2) -> b_idx (sample index; O(1) cu_seqlens lookup)
+#
+# Tensors are packed: q (total_q, H_Q, D), k/v (total_k, H_KV, D),
+# LSE (total_q, H_Q) fp32. Attention is block-diagonal: each sample attends
+# only to its own K/V range [cu_seqlens_k[b], cu_seqlens_k[b+1]).
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_varlen_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_vt, stride_vh, stride_vd,
+    stride_ot, stride_oh, stride_od,
+    CuSeqlensQ_ptr,  # int32 (B+1,) contiguous
+    CuSeqlensK_ptr,  # int32 (B+1,) contiguous
+    N_Q_HEADS,
+    N_KV_HEADS,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,  # 0 = no sliding window
+    LSE_ptr,
+    stride_lset, stride_lseh,
+    STORE_LSE: tl.constexpr,
+):
+    q_block_idx = tl.program_id(0)
+    q_h_idx = tl.program_id(1)
+    b_idx = tl.program_id(2)
+
+    # Per-sample bounds — O(1) load, no binary search.
+    seq_start_q = tl.load(CuSeqlensQ_ptr + b_idx)
+    seq_end_q = tl.load(CuSeqlensQ_ptr + b_idx + 1)
+    seq_len_q = seq_end_q - seq_start_q
+    seq_start_k = tl.load(CuSeqlensK_ptr + b_idx)
+    seq_end_k = tl.load(CuSeqlensK_ptr + b_idx + 1)
+    seq_len_k = seq_end_k - seq_start_k
+
+    # Early-return for tiles past this sample's tail. Entire-block OOR — plain
+    # `q_mask < seq_len_q` only masks within a tile; varlen has whole tiles past
+    # the sample end that must not contribute LSE stores or output writes.
+    if q_block_idx * BLOCK_Q >= seq_len_q:
+        return
+
+    # GQA: map Q head to KV head group
+    kv_h_idx = q_h_idx * N_KV_HEADS // N_Q_HEADS
+
+    q_h_base = Q_ptr + q_h_idx * stride_qh
+    k_h_base = K_ptr + kv_h_idx * stride_kh
+    v_h_base = V_ptr + kv_h_idx * stride_vh
+    o_h_base = O_ptr + q_h_idx * stride_oh
+
+    # Seq-local indices for mask arithmetic, global indices for pointers.
+    q_local = q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_mask = q_local < seq_len_q
+    q_global = seq_start_q + q_local
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # KV iteration range (seq-local).
+    if IS_CAUSAL:
+        kv_end_local = tl.minimum(seq_len_k, (q_block_idx + 1) * BLOCK_Q)
+    else:
+        kv_end_local = seq_len_k
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_min_local = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
+        kv_loop_start_local = (kv_min_local // BLOCK_KV) * BLOCK_KV
+    else:
+        kv_loop_start_local = 0
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
+    m_i = tl.full([BLOCK_Q], value=-float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+
+    # Two-phase split optimisation (same as batched kernel; skip at D=512 where
+    # the two-loop code's register pressure is a net loss). For varlen the
+    # unmasked phase is still safe because the sample's seq boundary is handled
+    # by kv_end_local ≤ seq_len_k (phase 1 iterates up to kv_end_unmasked_local
+    # which is monotone-rounded below the diagonal anyway).
+    USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)
+    if (IS_CAUSAL and SLIDE_SIZE == 0) and USE_SPLIT:
+        kv_end_unmasked_local = (q_block_idx * BLOCK_Q) // BLOCK_KV * BLOCK_KV
+    else:
+        kv_end_unmasked_local = kv_loop_start_local
+
+    # Phase 1: unmasked (off-diagonal, dense). All queries see all keys in the tile.
+    for kv_start_local in range(kv_loop_start_local, kv_end_unmasked_local, BLOCK_KV):
+        kv_local = kv_start_local + tl.arange(0, BLOCK_KV)
+        kv_global = seq_start_k + kv_local
+
+        q_ptrs = q_h_base + q_global[:, None] * stride_qt + d_range[None, :] * stride_qd
+        q_chunk = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+        k_ptrs = k_h_base + kv_global[:, None] * stride_kt + d_range[None, :] * stride_kd
+        k_chunk = tl.load(k_ptrs)
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
+
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        alpha = tl.math.exp2(m_i - new_max)
+        p = tl.math.exp2(scores - new_max[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        v_ptrs = v_h_base + kv_global[:, None] * stride_vt + d_range[None, :] * stride_vd
+        v_block = tl.load(v_ptrs)
+        acc += tl.dot(p.to(v_block.dtype), v_block)
+
+        m_i = new_max
+
+    # Phase 2: masked (diagonal + sample boundary + SWA).
+    for kv_start_local in range(kv_end_unmasked_local, kv_end_local, BLOCK_KV):
+        kv_local = kv_start_local + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_local < seq_len_k
+        kv_global = seq_start_k + kv_local
+
+        q_ptrs = q_h_base + q_global[:, None] * stride_qt + d_range[None, :] * stride_qd
+        q_chunk = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+        k_ptrs = k_h_base + kv_global[:, None] * stride_kt + d_range[None, :] * stride_kd
+        k_chunk = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
+
+        if IS_CAUSAL:
+            if SLIDE_SIZE > 0:
+                valid = (kv_local[None, :] <= q_local[:, None]) & \
+                        (q_local[:, None] - kv_local[None, :] < SLIDE_SIZE) & \
+                        kv_mask[None, :]
+            else:
+                valid = (kv_local[None, :] <= q_local[:, None]) & kv_mask[None, :]
+        else:
+            valid = kv_mask[None, :]
+        scores = tl.where(valid, scores, -float("inf"))
+
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        if SLIDE_SIZE > 0:
+            safe_new = tl.maximum(new_max, -1e20)
+            alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
+            p = tl.math.exp2(scores - safe_new[:, None])
+        else:
+            alpha = tl.math.exp2(m_i - new_max)
+            p = tl.math.exp2(scores - new_max[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        v_ptrs = v_h_base + kv_global[:, None] * stride_vt + d_range[None, :] * stride_vd
+        v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+        acc += tl.dot(p.to(v_block.dtype), v_block)
+
+        m_i = new_max
+
+    acc = acc / l_i[:, None]
+
+    o_ptrs = o_h_base + q_global[:, None] * stride_ot + d_range[None, :] * stride_od
+    tl.store(o_ptrs, acc, mask=q_mask[:, None])
+
+    if STORE_LSE:
+        LN2: tl.constexpr = 0.6931471805599453
+        lse = m_i * LN2 + tl.log(l_i)
+        lse_ptrs = LSE_ptr + q_global * stride_lset + q_h_idx * stride_lseh
         tl.store(lse_ptrs, lse, mask=q_mask)
 
 
@@ -710,6 +886,125 @@ def attention_swa_ref(q, k, v, slide_size):
 
 
 # =====================================================================
+# Varlen reference + pack helpers (used by tests and users)
+#
+# Packed layout:
+#   q: (total_q, H_Q,  D)
+#   k: (total_k, H_KV, D)
+#   v: (total_k, H_KV, D)
+#   cu_seqlens_q / cu_seqlens_k: int32, shape (B+1,) — cumulative sample boundaries
+#
+# Each sample is a contiguous slice of rows: sample b owns q[cu_seqlens_q[b]:cu_seqlens_q[b+1]].
+# Attention is block-diagonal: tokens in sample b only attend to tokens in sample b.
+# =====================================================================
+
+def attention_gqa_varlen_ref(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                             max_seqlen_q, max_seqlen_k,
+                             causal=False, window_size=0):
+    """Per-sample SDPA reference for varlen attention.
+
+    Reuses `attention_gqa_ref` (no SWA) and `attention_swa_ref` (SWA) per sample,
+    so the numerical reference matches what the batched path already uses.
+
+    Args:
+        q: (total_q, H_Q, D)
+        k/v: (total_k, H_KV, D)
+        cu_seqlens_q / cu_seqlens_k: int32 (B+1,) on the same device as q
+        max_seqlen_q / max_seqlen_k: ints (hints, unused here; kernel needs them)
+        causal: bool
+        window_size: 0 = no SWA; >0 = SWA window (equivalent to slide_size)
+
+    Returns:
+        (total_q, H_Q, D) packed output, same dtype as q.
+    """
+    total_q, H_Q, D = q.shape
+    _, H_KV, _ = k.shape
+    out = torch.empty_like(q)
+    B = cu_seqlens_q.numel() - 1
+    cu_q = cu_seqlens_q.tolist()
+    cu_k = cu_seqlens_k.tolist()
+    for b in range(B):
+        qs, qe = cu_q[b], cu_q[b + 1]
+        ks, ke = cu_k[b], cu_k[b + 1]
+        if qe == qs:
+            continue
+        # Reshape slice to (1, H, L, D) for the batched reference helpers.
+        qi = q[qs:qe].transpose(0, 1).unsqueeze(0).contiguous()
+        ki = k[ks:ke].transpose(0, 1).unsqueeze(0).contiguous()
+        vi = v[ks:ke].transpose(0, 1).unsqueeze(0).contiguous()
+        if window_size > 0 and causal and (ke - ks) > window_size:
+            oi = attention_swa_ref(qi, ki, vi, slide_size=window_size)
+        else:
+            oi = attention_gqa_ref(qi, ki, vi, causal=causal)
+        out[qs:qe] = oi.squeeze(0).transpose(0, 1).contiguous()
+    return out
+
+
+def pack_batched_to_varlen(q_bhnd, k_bhnd, v_bhnd, seqlens):
+    """Pack a (B, H, N, D) batched tensor into (total, H, D) plus cu_seqlens.
+
+    Only the first `seqlens[b]` rows of each batch element are kept.
+
+    Args:
+        q_bhnd: (B, H_Q,  N, D)
+        k_bhnd: (B, H_KV, N, D)
+        v_bhnd: (B, H_KV, N, D)
+        seqlens: int tensor shape (B,), actual length of each sample, each ≤ N.
+
+    Returns:
+        q_packed (total_q, H_Q, D), k_packed / v_packed (total_k, H_KV, D),
+        cu_seqlens (int32, B+1) on the same device as q_bhnd.
+
+    cu_seqlens is shared between Q and K because the batched path has N_q == N_k
+    per sample; callers that need different Q/K packing should build their own.
+    """
+    B, H_Q, N, D = q_bhnd.shape
+    _, H_KV, _, _ = k_bhnd.shape
+    seqlens = seqlens.to(dtype=torch.int64)
+    total = int(seqlens.sum().item())
+    device = q_bhnd.device
+    q_packed = torch.empty(total, H_Q, D, dtype=q_bhnd.dtype, device=device)
+    k_packed = torch.empty(total, H_KV, D, dtype=k_bhnd.dtype, device=device)
+    v_packed = torch.empty(total, H_KV, D, dtype=v_bhnd.dtype, device=device)
+    offset = 0
+    for b in range(B):
+        L = int(seqlens[b].item())
+        # (H, L, D) -> (L, H, D)
+        q_packed[offset:offset + L] = q_bhnd[b, :, :L, :].transpose(0, 1).contiguous()
+        k_packed[offset:offset + L] = k_bhnd[b, :, :L, :].transpose(0, 1).contiguous()
+        v_packed[offset:offset + L] = v_bhnd[b, :, :L, :].transpose(0, 1).contiguous()
+        offset += L
+    cu = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    cu[1:] = seqlens.to(dtype=torch.int32).cumsum(0)
+    return q_packed, k_packed, v_packed, cu
+
+
+def unpack_varlen_to_batched(x_packed, cu_seqlens, max_seqlen, n_heads):
+    """Invert pack_batched_to_varlen for a single tensor.
+
+    Args:
+        x_packed: (total, H, D)
+        cu_seqlens: int32 (B+1,)
+        max_seqlen: int — pad each sample to this length along the seq axis
+        n_heads: H
+
+    Returns:
+        (B, H, max_seqlen, D) with zeros past each sample's actual length.
+    """
+    total, H, D = x_packed.shape
+    assert H == n_heads
+    B = cu_seqlens.numel() - 1
+    out = torch.zeros(B, H, max_seqlen, D, dtype=x_packed.dtype, device=x_packed.device)
+    cu = cu_seqlens.tolist()
+    for b in range(B):
+        s, e = cu[b], cu[b + 1]
+        L = e - s
+        # (L, H, D) -> (H, L, D)
+        out[b, :, :L, :] = x_packed[s:e].transpose(0, 1).contiguous()
+    return out
+
+
+# =====================================================================
 # Flash Attention GQA — Backward Pass
 #
 # Two kernels:
@@ -886,6 +1181,140 @@ def _flash_attn_gqa_bwd_dq_kernel(
 
     # Store dQ
     dq_ptrs = dq_base + q_offsets[:, None] * stride_dqn + d_range[None, :] * stride_dqd
+    tl.store(dq_ptrs, dq_acc.to(q_block.dtype), mask=q_mask[:, None])
+
+
+# =====================================================================
+# Flash Attention GQA — Varlen backward dQ kernel
+#
+# Grid: (cdiv(max_seqlen_q, BQ), H_Q, B). Mirrors varlen fwd grid so the
+# (q_block_idx, q_h_idx, b_idx) decomposition stays identical and the same
+# per-sample early-return applies.
+#
+# Keeps STORE_DELTA fusion: prologue computes delta = rowsum(dO * O) into
+# packed delta (total_q, H_Q), saving a separate delta kernel launch.
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_varlen_bwd_dq_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, O_ptr, dQ_ptr,
+    LSE_ptr, Delta_ptr,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_vt, stride_vh, stride_vd,
+    stride_dot, stride_doh, stride_dod,
+    stride_ot, stride_oh, stride_od,
+    stride_dqt, stride_dqh, stride_dqd,
+    stride_lset, stride_lseh,
+    stride_dt, stride_dh,
+    CuSeqlensQ_ptr,  # int32 (B+1,)
+    CuSeqlensK_ptr,  # int32 (B+1,)
+    N_Q_HEADS, N_KV_HEADS,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+    STORE_DELTA: tl.constexpr,
+):
+    q_block_idx = tl.program_id(0)
+    q_h_idx = tl.program_id(1)
+    b_idx = tl.program_id(2)
+
+    # Per-sample bounds.
+    seq_start_q = tl.load(CuSeqlensQ_ptr + b_idx)
+    seq_end_q = tl.load(CuSeqlensQ_ptr + b_idx + 1)
+    seq_len_q = seq_end_q - seq_start_q
+    seq_start_k = tl.load(CuSeqlensK_ptr + b_idx)
+    seq_end_k = tl.load(CuSeqlensK_ptr + b_idx + 1)
+    seq_len_k = seq_end_k - seq_start_k
+
+    if q_block_idx * BLOCK_Q >= seq_len_q:
+        return
+
+    kv_h_idx = q_h_idx * N_KV_HEADS // N_Q_HEADS
+
+    q_h_base = Q_ptr + q_h_idx * stride_qh
+    k_h_base = K_ptr + kv_h_idx * stride_kh
+    v_h_base = V_ptr + kv_h_idx * stride_vh
+    do_h_base = dO_ptr + q_h_idx * stride_doh
+    dq_h_base = dQ_ptr + q_h_idx * stride_dqh
+
+    q_local = q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_mask = q_local < seq_len_q
+    q_global = seq_start_q + q_local
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # Load Q, dO blocks (persist across KV loop).
+    q_ptrs = q_h_base + q_global[:, None] * stride_qt + d_range[None, :] * stride_qd
+    q_block = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    do_ptrs = do_h_base + q_global[:, None] * stride_dot + d_range[None, :] * stride_dod
+    do_block = tl.load(do_ptrs, mask=q_mask[:, None], other=0.0)
+
+    # Load LSE (packed layout) and handle Delta (possibly fused).
+    lse_ptrs = LSE_ptr + q_global * stride_lset + q_h_idx * stride_lseh
+    lse = tl.load(lse_ptrs, mask=q_mask, other=0.0)
+    delta_ptrs = Delta_ptr + q_global * stride_dt + q_h_idx * stride_dh
+    if STORE_DELTA:
+        # Prologue fusion: compute delta = rowsum(dO * O) and store for dKV.
+        o_h_base = O_ptr + q_h_idx * stride_oh
+        o_ptrs = o_h_base + q_global[:, None] * stride_ot + d_range[None, :] * stride_od
+        o_block = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0)
+        delta = tl.sum(do_block.to(tl.float32) * o_block.to(tl.float32), axis=1)
+        tl.store(delta_ptrs, delta, mask=q_mask)
+    else:
+        delta = tl.load(delta_ptrs, mask=q_mask, other=0.0)
+
+    # KV iteration bounds (seq-local; mirrors varlen fwd).
+    if IS_CAUSAL:
+        kv_end_local = tl.minimum(seq_len_k, (q_block_idx + 1) * BLOCK_Q)
+    else:
+        kv_end_local = seq_len_k
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_min_local = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
+        kv_loop_start_local = (kv_min_local // BLOCK_KV) * BLOCK_KV
+    else:
+        kv_loop_start_local = 0
+
+    dq_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+    lse_log2 = lse * LOG2E
+
+    for kv_start_local in range(kv_loop_start_local, kv_end_local, BLOCK_KV):
+        kv_local = kv_start_local + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_local < seq_len_k
+        kv_global = seq_start_k + kv_local
+
+        k_ptrs = k_h_base + kv_global[:, None] * stride_kt + d_range[None, :] * stride_kd
+        k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        v_ptrs = v_h_base + kv_global[:, None] * stride_vt + d_range[None, :] * stride_vd
+        v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+        scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
+        if IS_CAUSAL:
+            if SLIDE_SIZE > 0:
+                valid = (kv_local[None, :] <= q_local[:, None]) & \
+                        (q_local[:, None] - kv_local[None, :] < SLIDE_SIZE) & \
+                        kv_mask[None, :]
+            else:
+                valid = (kv_local[None, :] <= q_local[:, None]) & kv_mask[None, :]
+        else:
+            valid = kv_mask[None, :]
+        scores = tl.where(valid, scores, -float("inf"))
+        p = tl.math.exp2(scores - lse_log2[:, None])
+
+        dp = tl.dot(do_block, tl.trans(v_block)).to(tl.float32)
+        ds = p * (dp - delta[:, None])
+        ds = tl.where(valid, ds, 0.0)
+
+        dq_acc += tl.dot(ds.to(k_block.dtype), k_block).to(tl.float32)
+
+    dq_acc *= scale
+
+    dq_ptrs = dq_h_base + q_global[:, None] * stride_dqt + d_range[None, :] * stride_dqd
     tl.store(dq_ptrs, dq_acc.to(q_block.dtype), mask=q_mask[:, None])
 
 
@@ -1143,9 +1572,9 @@ def _flash_attn_gqa_bwd_dkv_kernel(
     dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
     dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
     if ATOMIC_REDUCE:
-        # Atomic fuse into shared dK/dV, avoiding expand+reduce pass.
-        tl.atomic_add(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
-        tl.atomic_add(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+        # Triton 3.6: atomic_add doesn't support bf16. Caller provides fp32 buffers.
+        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
     else:
         tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
         tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
@@ -1329,11 +1758,178 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     dk_ptrs = dk_base + kv_offsets[:, None] * stride_dkn + d_range[None, :] * stride_dkd
     dv_ptrs = dv_base + kv_offsets[:, None] * stride_dvn + d_range[None, :] * stride_dvd
     if Q_SPLITS > 1:
-        # Caller pre-zeroed dK/dV; multiple programs contribute via atomic_add.
-        tl.atomic_add(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
-        tl.atomic_add(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+        # Triton 3.6: atomic_add doesn't support bf16. Caller provides fp32 buffers.
+        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
     else:
         # Direct store — only this program writes this tile.
+        tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
+        tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
+
+
+# =====================================================================
+# Flash Attention GQA — Varlen backward pack-GQA dK/dV kernel
+#
+# Grid: (cdiv(max_seqlen_k, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS).
+# Packed dK/dV accumulate over all GQA Q heads via an inner static_range loop —
+# single dk_acc/dv_acc per program → direct store (QS=1) or atomic_add (QS>1)
+# to pre-zeroed packed dK/dV (total_k, H_KV, D).
+#
+# Per-sample bounds MUST be computed before the tl.static_range(GQA_RATIO)
+# loop so the Triton unroller can fold them once instead of re-emitting GQA
+# times.
+#
+# Atomic safety: kv_global = seq_start_k + kv_local is unique across b_idx
+# (cu_seqlens strictly monotone), so programs from different samples never
+# write to the same packed row of dK/dV. Only Q_SPLITS programs within a single
+# sample's (kv_h, kv_block) cohort contend — identical to batched.
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_varlen_bwd_dkv_packed_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, dK_ptr, dV_ptr,
+    LSE_ptr, Delta_ptr,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_vt, stride_vh, stride_vd,
+    stride_dot, stride_doh, stride_dod,
+    stride_dkt, stride_dkh, stride_dkd,
+    stride_dvt, stride_dvh, stride_dvd,
+    stride_lset, stride_lseh,
+    stride_dt, stride_dh,
+    CuSeqlensQ_ptr,  # int32 (B+1,)
+    CuSeqlensK_ptr,  # int32 (B+1,)
+    N_Q_HEADS, N_KV_HEADS,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    GQA_RATIO: tl.constexpr,  # N_Q_HEADS // N_KV_HEADS
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+    Q_SPLITS: tl.constexpr,
+):
+    kv_block_idx = tl.program_id(0)
+    bkvh_idx = tl.program_id(1)
+    split_idx = tl.program_id(2)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    # Per-sample bounds (hoisted outside the GQA static_range).
+    seq_start_q = tl.load(CuSeqlensQ_ptr + b_idx)
+    seq_end_q = tl.load(CuSeqlensQ_ptr + b_idx + 1)
+    seq_len_q = seq_end_q - seq_start_q
+    seq_start_k = tl.load(CuSeqlensK_ptr + b_idx)
+    seq_end_k = tl.load(CuSeqlensK_ptr + b_idx + 1)
+    seq_len_k = seq_end_k - seq_start_k
+
+    if kv_block_idx * BLOCK_KV >= seq_len_k:
+        # OOR kv_block for this sample — no atomic writes, no stores.
+        return
+
+    k_h_base = K_ptr + kv_h_idx * stride_kh
+    v_h_base = V_ptr + kv_h_idx * stride_vh
+    dk_h_base = dK_ptr + kv_h_idx * stride_dkh
+    dv_h_base = dV_ptr + kv_h_idx * stride_dvh
+
+    kv_local = kv_block_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
+    kv_mask = kv_local < seq_len_k
+    kv_global = seq_start_k + kv_local
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # Load K, V once — reused across all GQA_RATIO Q heads.
+    k_ptrs = k_h_base + kv_global[:, None] * stride_kt + d_range[None, :] * stride_kd
+    k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+    v_ptrs = v_h_base + kv_global[:, None] * stride_vt + d_range[None, :] * stride_vd
+    v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+    dk_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+    dv_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
+    # Q iteration bounds (seq-local). Symmetric to varlen fwd/dQ.
+    if IS_CAUSAL:
+        q_start_local = (kv_block_idx * BLOCK_KV // BLOCK_Q) * BLOCK_Q
+    else:
+        q_start_local = 0
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_last_local = kv_block_idx * BLOCK_KV + BLOCK_KV - 1
+        q_max_local = kv_last_local + SLIDE_SIZE - 1
+        q_loop_end_local = ((q_max_local // BLOCK_Q) + 1) * BLOCK_Q
+        q_loop_end_local = tl.minimum(seq_len_q, q_loop_end_local)
+    else:
+        q_loop_end_local = seq_len_q
+
+    # Q-split slicing (local bounds).
+    if Q_SPLITS > 1:
+        total_q_blocks = (q_loop_end_local - q_start_local + BLOCK_Q - 1) // BLOCK_Q
+        blocks_per_split = (total_q_blocks + Q_SPLITS - 1) // Q_SPLITS
+        q_lo_local = q_start_local + split_idx * blocks_per_split * BLOCK_Q
+        q_hi_local = tl.minimum(
+            q_loop_end_local,
+            q_start_local + (split_idx + 1) * blocks_per_split * BLOCK_Q,
+        )
+    else:
+        q_lo_local = q_start_local
+        q_hi_local = q_loop_end_local
+
+    # Outer loop: Q heads (unrolled). Each contributes into dk_acc/dv_acc.
+    for qh_offset in tl.static_range(GQA_RATIO):
+        q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
+        q_h_base = Q_ptr + q_h_idx * stride_qh
+        do_h_base = dO_ptr + q_h_idx * stride_doh
+
+        for q_start_pos_local in range(q_lo_local, q_hi_local, BLOCK_Q):
+            q_local = q_start_pos_local + tl.arange(0, BLOCK_Q)
+            q_mask_local = q_local < seq_len_q
+            q_global = seq_start_q + q_local
+
+            q_ptrs = q_h_base + q_global[:, None] * stride_qt + d_range[None, :] * stride_qd
+            q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
+            do_ptrs = do_h_base + q_global[:, None] * stride_dot + d_range[None, :] * stride_dod
+            do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
+
+            lse_ptrs = LSE_ptr + q_global * stride_lset + q_h_idx * stride_lseh
+            lse = tl.load(lse_ptrs, mask=q_mask_local, other=0.0)
+            delta_ptrs = Delta_ptr + q_global * stride_dt + q_h_idx * stride_dh
+            delta = tl.load(delta_ptrs, mask=q_mask_local, other=0.0)
+            lse_log2 = lse * LOG2E
+
+            scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
+            if IS_CAUSAL:
+                if SLIDE_SIZE > 0:
+                    valid = (kv_local[None, :] <= q_local[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None] & \
+                            (q_local[:, None] - kv_local[None, :] < SLIDE_SIZE)
+                else:
+                    valid = (kv_local[None, :] <= q_local[:, None]) & \
+                            kv_mask[None, :] & q_mask_local[:, None]
+            else:
+                valid = kv_mask[None, :] & q_mask_local[:, None]
+            scores = tl.where(valid, scores, -float("inf"))
+            p = tl.math.exp2(scores - lse_log2[:, None])
+
+            dv_acc += tl.dot(tl.trans(p.to(do_block.dtype)), do_block).to(tl.float32)
+
+            dp = tl.dot(do_block, tl.trans(v_block)).to(tl.float32)
+            ds = p * (dp - delta[:, None])
+            ds = tl.where(valid, ds, 0.0)
+
+            dk_acc += tl.dot(tl.trans(ds.to(q_block.dtype)), q_block).to(tl.float32)
+
+    dk_acc *= scale
+
+    dk_ptrs = dk_h_base + kv_global[:, None] * stride_dkt + d_range[None, :] * stride_dkd
+    dv_ptrs = dv_h_base + kv_global[:, None] * stride_dvt + d_range[None, :] * stride_dvd
+    if Q_SPLITS > 1:
+        # Triton 3.6: atomic_add does not support bf16. dk_acc/dv_acc are fp32;
+        # when Q_SPLITS > 1 the caller allocates dK/dV as fp32 buffers.
+        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
+    else:
         tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
         tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
 
@@ -1567,10 +2163,25 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= N:
             slide_size = 0
 
-        BLOCK_Q = 64 if D >= 512 else 128
-        BLOCK_KV = 32 if D >= 512 else 64
+        # H200 + Triton 3.2 shmem budget is 228 KB. Older table
+        # (BQ=64/BKV=32 @ D=512, BQ=128/BKV=64 @ D=256, w=8) compiled on
+        # earlier Triton but now over-budget by ~10-25 KB. Shrink to the
+        # same configs the varlen Function uses — mathematically identical,
+        # ~10-20% slower at D=256/D=512 on H100 but compiles on both envs.
+        # D<256 unchanged (was already fitting).
+        if D >= 512:
+            BLOCK_Q = 32
+            BLOCK_KV = 32
+            num_warps = 4
+        elif D >= 256:
+            BLOCK_Q = 64
+            BLOCK_KV = 64
+            num_warps = 4
+        else:
+            BLOCK_Q = 128
+            BLOCK_KV = 64
+            num_warps = 4
         BLOCK_D = D
-        num_warps = 8 if D >= 256 else 4
         num_stages = 2
         BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
         BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
@@ -1736,8 +2347,8 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # allocator call + 1 cudaMemsetAsync for the QS>1 path. Tiny (~5μs) but
         # free since semantically identical.
         if Q_SPLITS_DKV > 1:
-            dkv = torch.empty((2,) + k.shape, dtype=k.dtype, device=k.device)
-            dkv.zero_()
+            # Triton 3.6 atomic_add doesn't support bf16 — accumulate in fp32
+            dkv = torch.zeros((2,) + k.shape, dtype=torch.float32, device=k.device)
             dk, dv = dkv[0], dkv[1]
         else:
             dk = torch.empty_like(k)
@@ -1766,6 +2377,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
+        if Q_SPLITS_DKV > 1:
+            dk = dk.to(k.dtype)
+            dv = dv.to(v.dtype)
+
         return dq, dk, dv, None, None, None, None, None
 
 
@@ -1785,6 +2400,262 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
     """
     return FlashAttnGQAFunction.apply(
         q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
+    )
+
+
+# =====================================================================
+# Flash Attention GQA — Varlen (packed / cu_seqlens) autograd Function
+#
+# Packed / FA2-compatible API: tensors are (total_tokens, H, D); cu_seqlens
+# marks per-sample boundaries. See docstring of `flash_attn_gqa_varlen` for
+# semantics.
+#
+# v1 assumes cu_seqlens_q == cu_seqlens_k (same packing for Q and K) — the
+# standard training case. Distinct Q/K packing is a v2 extension.
+# =====================================================================
+
+class FlashAttnGQAVarlenFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, causal, window_size):
+        total_q, H_Q, D = q.shape
+        _, H_KV, _ = k.shape
+        B = cu_seqlens_q.numel() - 1
+
+        # Normalize: window covering max_seqlen_k means degenerate full-causal.
+        slide_size = int(window_size)
+        if slide_size > 0 and slide_size >= int(max_seqlen_k):
+            slide_size = 0
+
+        output = torch.empty_like(q)
+        lse = torch.empty(total_q, H_Q, dtype=torch.float32, device=q.device)
+
+        # Forward block sizes.
+        # H200 + Triton 3.2 shmem budget is 228 KB. Each (BQ, BKV) block
+        # footprint is roughly (BQ + 2 * num_stages * BKV) * HEAD_DIM * 2 bytes
+        # for the Q/K/V tiles plus the fp32 accumulator (BQ * D * 4). The
+        # batched kernel's original table (BQ=64/BKV=32 @ D=512, BQ=128/BKV=64
+        # @ D=256) was tuned against older Triton's looser accounting; Triton
+        # 3.2 reports 256-257 KB for those, just over the cap. Shrink:
+        #   D=512: BQ=32, BKV=32 (was BQ=64)
+        #   D=256: BQ=64, BKV=64 (was BQ=128) — keep larger BKV for HBM reuse
+        #   D<256: BQ=128, BKV=64 (fits easily)
+        # tl.dot requires tile dims ≥ 16, so clamp the floor to 16.
+        if D >= 512:
+            BLOCK_Q = 32
+            BLOCK_KV = 32
+            num_warps = 4
+        elif D >= 256:
+            BLOCK_Q = 64
+            BLOCK_KV = 64
+            num_warps = 4
+        else:
+            BLOCK_Q = 128
+            BLOCK_KV = 64
+            num_warps = 4
+        num_stages = 2
+        BLOCK_Q = max(16, min(BLOCK_Q, triton.next_power_of_2(int(max_seqlen_q))))
+        BLOCK_KV = max(16, min(BLOCK_KV, triton.next_power_of_2(int(max_seqlen_k))))
+
+        grid = (triton.cdiv(int(max_seqlen_q), BLOCK_Q), H_Q, B)
+        _flash_attn_gqa_varlen_fwd_kernel[grid](
+            q, k, v, output,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            cu_seqlens_q, cu_seqlens_k,
+            N_Q_HEADS=H_Q, N_KV_HEADS=H_KV,
+            HEAD_DIM=D,
+            scale=1.0 / math.sqrt(D),
+            BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, BLOCK_D=D,
+            IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+            LSE_ptr=lse, stride_lset=lse.stride(0), stride_lseh=lse.stride(1),
+            STORE_LSE=True,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+        ctx.save_for_backward(q, k, v, output, lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.max_seqlen_q = int(max_seqlen_q)
+        ctx.max_seqlen_k = int(max_seqlen_k)
+        ctx.causal = causal
+        ctx.slide_size = slide_size
+        ctx.H_KV = H_KV
+        return output
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        causal = ctx.causal
+        slide_size = ctx.slide_size
+        H_KV = ctx.H_KV
+        max_seqlen_q = ctx.max_seqlen_q
+        max_seqlen_k = ctx.max_seqlen_k
+
+        total_q, H_Q, D = q.shape
+        total_k, _, _ = k.shape
+        B = cu_seqlens_q.numel() - 1
+        scale = 1.0 / math.sqrt(D)
+        GQA_RATIO = H_Q // H_KV
+
+        # Packed delta (filled by dQ prologue via STORE_DELTA=True).
+        delta = torch.empty(total_q, H_Q, dtype=torch.float32, device=q.device)
+        dq = torch.empty_like(q)
+
+        # --- dQ kernel ---
+        if D >= 512:
+            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
+        else:
+            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
+        BLOCK_Q_BW = max(16, min(BLOCK_Q_BW, triton.next_power_of_2(max_seqlen_q)))
+        BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(max_seqlen_k)))
+        grid_dq = (triton.cdiv(max_seqlen_q, BLOCK_Q_BW), H_Q, B)
+
+        _flash_attn_gqa_varlen_bwd_dq_kernel[grid_dq](
+            q, k, v, do, o, dq, lse, delta,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            dq.stride(0), dq.stride(1), dq.stride(2),
+            lse.stride(0), lse.stride(1),
+            delta.stride(0), delta.stride(1),
+            cu_seqlens_q, cu_seqlens_k,
+            N_Q_HEADS=H_Q, N_KV_HEADS=H_KV,
+            HEAD_DIM=D, scale=scale,
+            BLOCK_Q=BLOCK_Q_BW, BLOCK_KV=BLOCK_KV_BW,
+            IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+            STORE_DELTA=True,
+            num_warps=num_warps_bw, num_stages=2,
+        )
+
+        # --- dK/dV kernel (pack-GQA) ---
+        if D >= 512:
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
+            num_stages_dkv = 2
+        else:
+            grid_at_bkv64 = triton.cdiv(max_seqlen_k, 64) * B * H_KV
+            if grid_at_bkv64 >= 128 or grid_at_bkv64 <= 16:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 64, 128, 8
+                num_stages_dkv = 1
+            else:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
+                num_stages_dkv = 2
+        BLOCK_KV_DKV = max(16, min(BLOCK_KV_DKV, triton.next_power_of_2(max_seqlen_k)))
+        BLOCK_Q_DKV = max(16, min(BLOCK_Q_DKV, triton.next_power_of_2(max_seqlen_q)))
+
+        raw_grid_dkv = triton.cdiv(max_seqlen_k, BLOCK_KV_DKV) * B * H_KV
+        target_grid = 128 if BLOCK_KV_DKV == 64 else 256
+        if raw_grid_dkv >= target_grid:
+            Q_SPLITS_DKV = 1
+        elif raw_grid_dkv * 2 >= target_grid:
+            Q_SPLITS_DKV = 2
+        elif raw_grid_dkv * 4 >= target_grid:
+            Q_SPLITS_DKV = 4
+        else:
+            Q_SPLITS_DKV = 8
+
+        grid_dkv = (triton.cdiv(max_seqlen_k, BLOCK_KV_DKV), B * H_KV, Q_SPLITS_DKV)
+
+        if Q_SPLITS_DKV > 1:
+            # Triton 3.6 atomic_add doesn't support bf16 — accumulate in fp32
+            dkv = torch.zeros((2,) + k.shape, dtype=torch.float32, device=k.device)
+            dk, dv = dkv[0], dkv[1]
+        else:
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+
+        _flash_attn_gqa_varlen_bwd_dkv_packed_kernel[grid_dkv](
+            q, k, v, do, dk, dv, lse, delta,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            do.stride(0), do.stride(1), do.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2),
+            dv.stride(0), dv.stride(1), dv.stride(2),
+            lse.stride(0), lse.stride(1),
+            delta.stride(0), delta.stride(1),
+            cu_seqlens_q, cu_seqlens_k,
+            N_Q_HEADS=H_Q, N_KV_HEADS=H_KV,
+            HEAD_DIM=D, scale=scale,
+            BLOCK_Q=BLOCK_Q_DKV, BLOCK_KV=BLOCK_KV_DKV,
+            GQA_RATIO=GQA_RATIO,
+            IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+            Q_SPLITS=Q_SPLITS_DKV,
+            num_warps=num_warps_dkv, num_stages=num_stages_dkv,
+        )
+
+        if Q_SPLITS_DKV > 1:
+            dk = dk.to(k.dtype)
+            dv = dv.to(v.dtype)
+
+        return dq, dk, dv, None, None, None, None, None, None
+
+
+def flash_attn_gqa_varlen(q, k, v,
+                          cu_seqlens_q, cu_seqlens_k,
+                          max_seqlen_q, max_seqlen_k,
+                          causal=False, window_size=0):
+    """Variable-length (packed-sequence) Flash Attention with GQA and SWA.
+
+    FA2-compatible API. Tensors are packed across samples along a single token
+    axis; per-sample boundaries come from cu_seqlens.
+
+    Args:
+        q: (total_q, N_Q_HEADS, D)
+        k: (total_k, N_KV_HEADS, D)
+        v: (total_k, N_KV_HEADS, D)
+        cu_seqlens_q: int32, shape (B+1,), cumulative sample-start offsets for q.
+        cu_seqlens_k: int32, shape (B+1,), cumulative sample-start offsets for k/v.
+        max_seqlen_q: int — max over (cu_seqlens_q[i+1] - cu_seqlens_q[i]).
+        max_seqlen_k: int — max over (cu_seqlens_k[i+1] - cu_seqlens_k[i]).
+        causal: bool. When True and window_size=0, standard causal block-diagonal.
+        window_size: 0 disables SWA. >0 applies a per-sample left window of size
+            `window_size` (equivalent to slide_size in the batched API).
+
+    Returns:
+        out: (total_q, N_Q_HEADS, D), same dtype as q.
+
+    v1 limitations:
+        - Text-only (no image-group OR-mask).
+        - Assumes cu_seqlens_q == cu_seqlens_k (same packing for Q and K/V).
+          Distinct Q/K packing is a v2 extension.
+    """
+    # --- Type + shape validation ---
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "q/k/v must be on CUDA"
+    assert q.dtype == k.dtype == v.dtype, "q/k/v dtype mismatch"
+    assert q.dtype in (torch.float16, torch.bfloat16), \
+        f"dtype must be fp16/bf16, got {q.dtype}"
+    assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3, \
+        f"q/k/v must be 3-D packed (total, H, D), got {q.shape}, {k.shape}, {v.shape}"
+    assert k.shape == v.shape, f"k/v shape mismatch: {k.shape} vs {v.shape}"
+    total_q, H_Q, D = q.shape
+    total_k, H_KV, D_kv = k.shape
+    assert D == D_kv, f"q/k head_dim mismatch: {D} vs {D_kv}"
+    assert H_Q % H_KV == 0, f"GQA ratio must be integer: H_Q={H_Q}, H_KV={H_KV}"
+    assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_k.dtype == torch.int32, \
+        "cu_seqlens must be int32"
+    assert cu_seqlens_q.is_cuda and cu_seqlens_k.is_cuda, "cu_seqlens must be on CUDA"
+    assert cu_seqlens_q.device == q.device and cu_seqlens_k.device == q.device, \
+        "cu_seqlens device mismatch"
+    assert cu_seqlens_q.numel() == cu_seqlens_k.numel(), \
+        "cu_seqlens_q and cu_seqlens_k must have equal length"
+    # v1: require matching Q/K packing. Helpful error message for v2 upgrade path.
+    assert torch.equal(cu_seqlens_q, cu_seqlens_k), (
+        "v1 requires cu_seqlens_q == cu_seqlens_k (same packing for Q and KV). "
+        "Distinct Q/K packing is a v2 extension."
+    )
+    assert int(max_seqlen_q) > 0 and int(max_seqlen_k) > 0, "max_seqlen must be positive"
+
+    # Token-axis contiguity: kernel assumes D-axis is last-contiguous.
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, \
+        "D axis must be contiguous (stride(-1) == 1)"
+
+    return FlashAttnGQAVarlenFunction.apply(
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        int(max_seqlen_q), int(max_seqlen_k),
+        bool(causal), int(window_size),
     )
 
 

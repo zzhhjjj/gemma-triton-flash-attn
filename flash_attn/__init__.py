@@ -39,6 +39,12 @@ from .attention import (
     attention_flash_gqa,
     flash_attn_gqa_train,
     FlashAttnGQAFunction,
+    # Varlen (packed cu_seqlens) API
+    flash_attn_gqa_varlen,
+    FlashAttnGQAVarlenFunction,
+    attention_gqa_varlen_ref,
+    pack_batched_to_varlen,
+    unpack_varlen_to_batched,
     # Reference implementations
     attention_gqa_ref,
     attention_swa_ref,
@@ -48,7 +54,14 @@ from .attention import (
 # HuggingFace transformers integration
 from .hf_integration import (
     register_triton_attention,
+    register_triton_attention_ulysses,
+    register_triton_attention_varlen,
+    register_triton_attention_varlen_ulysses,
     triton_gqa_attention,
+    triton_gqa_varlen_attention,
+    set_varlen_cu_seqlens,
+    clear_varlen_cu_seqlens,
+    cu_seqlens_from_2d_indices,
     patch_transformers_5_5_4_flash_attn_key,
     patch_gemma4_shared_kv_states_for_fsdp2,
     patch_gemma4_image_group_ids_for_kernel,
@@ -60,11 +73,18 @@ __all__ = [
     "attention_flash_gqa",
     "flash_attn_gqa_train",
     "FlashAttnGQAFunction",
+    # Varlen API
+    "flash_attn_gqa_varlen",
+    "FlashAttnGQAVarlenFunction",
+    "attention_gqa_varlen_ref",
+    "pack_batched_to_varlen",
+    "unpack_varlen_to_batched",
     "attention_gqa_ref",
     "attention_swa_ref",
     "attention",
     # HF transformers integration
     "register_triton_attention",
+    "register_triton_attention_ulysses",
     "triton_gqa_attention",
     "patch_transformers_5_5_4_flash_attn_key",
     "patch_gemma4_shared_kv_states_for_fsdp2",
