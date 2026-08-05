@@ -7,16 +7,34 @@ is numerically correct end-to-end.
 
 Run: pytest tests/test_noncausal_vision_shape.py -v
 """
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from flash_attn.attention import flash_attn_gqa_train, attention_flash_gqa
+from tests.numerics import Tolerance, assert_close
+
+
+pytestmark = pytest.mark.gpu
+
+OUTPUT_TOLERANCE = Tolerance(
+    cosine_min=0.9999,
+    max_abs=5e-3,
+    mean_abs=5e-4,
+    relative_l2=2e-2,
+)
+ADAPTER_TOLERANCE = Tolerance(
+    cosine_min=0.9999,
+    max_abs=2e-2,
+    mean_abs=7e-4,
+    relative_l2=2e-2,
+)
+GRAD_TOLERANCE = Tolerance(
+    cosine_min=0.9999,
+    max_abs=1e-1,
+    mean_abs=2e-3,
+    relative_l2=3e-2,
+)
 
 
 def sdpa_ref(q, k, v, causal=False):
@@ -39,10 +57,12 @@ def test_fwd_noncausal_matches_sdpa(B, H, N, D):
     ref = sdpa_ref(q, k, v, causal=False)
     out = attention_flash_gqa(q, k, v, causal=False, slide_size=0)
 
-    diff = (ref.float() - out.float()).abs()
-    # bf16 with N up to 1K tolerates ~1e-2 elementwise on small magnitudes
-    assert diff.max().item() < 5e-3, (
-        f"max|Δ|={diff.max().item():.2e} mean|Δ|={diff.mean().item():.2e}")
+    assert_close(
+        out,
+        ref,
+        name=f"vision_forward/B={B}/H={H}/N={N}/D={D}",
+        tolerance=OUTPUT_TOLERANCE,
+    )
 
 
 @pytest.mark.parametrize("B,H,N,D", [
@@ -69,10 +89,12 @@ def test_bwd_noncausal_matches_sdpa(B, H, N, D):
     for name, ours, theirs in [("dq", q.grad, qr.grad),
                                 ("dk", k.grad, kr.grad),
                                 ("dv", v.grad, vr.grad)]:
-        d = (ours.float() - theirs.float()).abs()
-        # bf16 grads accumulate more error; loosen vs fwd
-        assert d.max().item() < 1e-1, (
-            f"{name}: max|Δ|={d.max().item():.2e} mean|Δ|={d.mean().item():.2e}")
+        assert_close(
+            ours,
+            theirs,
+            name=f"vision_{name}/B={B}/H={H}/N={N}/D={D}",
+            tolerance=GRAD_TOLERANCE,
+        )
 
 
 def test_adapter_routes_noncausal_through_kernel():
@@ -98,11 +120,9 @@ def test_adapter_routes_noncausal_through_kernel():
     # ~2e-2 max elementwise vs the ~5e-3 used in the pure-kernel tests above.
     q_scaled = q * (D ** 0.5)  # cancel kernel's internal 1/sqrt(D)
     ref = sdpa_ref(q_scaled, k, v, causal=False).transpose(1, 2).contiguous()
-    diff = (ref.float() - out.float()).abs()
-    assert diff.max().item() < 2e-2, (
-        f"max|Δ|={diff.max().item():.2e} mean|Δ|={diff.mean().item():.2e}")
-
-
-if __name__ == "__main__":
-    import subprocess
-    sys.exit(subprocess.call(["pytest", __file__, "-v"]))
+    assert_close(
+        out,
+        ref,
+        name="vision_adapter",
+        tolerance=ADAPTER_TOLERANCE,
+    )

@@ -3,6 +3,51 @@ import triton
 import triton.language as tl
 import math
 
+try:
+    from .registry import AttentionSpec, DEFAULT_REGISTRY, KernelRole, RuntimeSpec
+    from .telemetry import (
+        get_active_attention_telemetry,
+        record_attention_selection,
+    )
+except ImportError:  # Support the historical `python flash_attn/attention.py` entry point.
+    from registry import AttentionSpec, DEFAULT_REGISTRY, KernelRole, RuntimeSpec
+    from telemetry import get_active_attention_telemetry, record_attention_selection
+
+
+def _resolve_attention_config(
+    q,
+    k,
+    *,
+    causal,
+    window_size,
+    layout,
+    training,
+    role: KernelRole,
+    batch_size,
+    query_length,
+    key_length,
+    image_groups=False,
+    telemetry=None,
+):
+    spec = AttentionSpec(
+        q_heads=q.shape[-3] if layout == "bhsd" else q.shape[-2],
+        kv_heads=k.shape[-3] if layout == "bhsd" else k.shape[-2],
+        head_dim=q.shape[-1],
+        dtype=str(q.dtype),
+        causal=bool(causal),
+        window_size=int(window_size),
+        layout=layout,
+        training=bool(training),
+        image_groups=bool(image_groups),
+        batch_size=int(batch_size),
+        query_length=int(query_length),
+        key_length=int(key_length),
+    )
+    runtime = RuntimeSpec.from_torch_device(q.device)
+    resolution = DEFAULT_REGISTRY.resolve(spec, runtime, role=role)
+    record_attention_selection(spec, runtime, resolution, recorder=telemetry)
+    return resolution
+
 
 # =====================================================================
 # PyTorch reference: scaled dot-product attention
@@ -790,22 +835,30 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     if slide_size > 0 and slide_size >= N:
         slide_size = 0
 
-    # Tuned defaults (sweeps in context/baseline.md). Block sizes scale inversely
-    # with HEAD_DIM to keep shared memory usage ~constant at ~128KB.
-    #   D=512 (Gemma4 full attn):     (BQ=64,  BKV=32) — shared memory constrained
-    #   D=256 (Gemma4 sliding attn):  (BQ=128, BKV=64) — more headroom, larger blocks win
-    #   D<256:                        (BQ=128, BKV=64) — same as D=256
-    # num_warps=8 for D>=256 (large tiles need many warps to hide latency).
+    resolution = _resolve_attention_config(
+        q,
+        k,
+        causal=causal,
+        window_size=slide_size,
+        layout="bhsd",
+        training=False,
+        role="forward",
+        batch_size=B,
+        query_length=N,
+        key_length=N,
+        image_groups=group_ids is not None,
+    )
+    selected = resolution.config
     if BLOCK_Q is None:
-        BLOCK_Q = 64 if D >= 512 else 128
+        BLOCK_Q = selected.block_q
     if BLOCK_KV is None:
-        BLOCK_KV = 32 if D >= 512 else 64
+        BLOCK_KV = selected.block_kv
     if BLOCK_D is None:
-        BLOCK_D = D  # no D-tiling: single tl.dot per KV tile
+        BLOCK_D = selected.block_d
     if num_warps is None:
-        num_warps = 8 if D >= 256 else 4
+        num_warps = selected.num_warps
     if num_stages is None:
-        num_stages = 2
+        num_stages = selected.num_stages
 
     BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
     BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
@@ -2163,26 +2216,24 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= N:
             slide_size = 0
 
-        # H200 + Triton 3.2 shmem budget is 228 KB. Older table
-        # (BQ=64/BKV=32 @ D=512, BQ=128/BKV=64 @ D=256, w=8) compiled on
-        # earlier Triton but now over-budget by ~10-25 KB. Shrink to the
-        # same configs the varlen Function uses — mathematically identical,
-        # ~10-20% slower at D=256/D=512 on H100 but compiles on both envs.
-        # D<256 unchanged (was already fitting).
-        if D >= 512:
-            BLOCK_Q = 32
-            BLOCK_KV = 32
-            num_warps = 4
-        elif D >= 256:
-            BLOCK_Q = 64
-            BLOCK_KV = 64
-            num_warps = 4
-        else:
-            BLOCK_Q = 128
-            BLOCK_KV = 64
-            num_warps = 4
-        BLOCK_D = D
-        num_stages = 2
+        selected = _resolve_attention_config(
+            q,
+            k,
+            causal=causal,
+            window_size=slide_size,
+            layout="bhsd",
+            training=True,
+            role="forward",
+            batch_size=B,
+            query_length=N,
+            key_length=N,
+            image_groups=group_ids is not None,
+        ).config
+        BLOCK_Q = selected.block_q
+        BLOCK_KV = selected.block_kv
+        BLOCK_D = selected.block_d
+        num_warps = selected.num_warps
+        num_stages = selected.num_stages
         BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
         BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
         grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
@@ -2218,6 +2269,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         ctx.causal = causal
         ctx.slide_size = slide_size
         ctx.has_group_ids = has_group_ids
+        # PyTorch's autograd engine does not preserve Python ContextVars. Carry
+        # the opt-in recorder explicitly so dQ/dKV selections join the same
+        # forward snapshot, including under FSDP's backward execution.
+        ctx.selection_telemetry = get_active_attention_telemetry()
         return output
 
     @staticmethod
@@ -2244,13 +2299,23 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # dk, dv allocated after dKV kernel (expanded buffer + reduce)
 
         # --- dQ kernel ---
-        # D-specific tuning (sweeps in context/baseline.md):
-        #   D=512: (BQ=32, BKV=64, w=8)  — register-constrained, need 8 warps
-        #   D=256: (BQ=64, BKV=64, w=4)  — more headroom, larger BQ + fewer warps win
-        if D >= 512:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
-        else:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
+        selected_dq = _resolve_attention_config(
+            q,
+            k,
+            causal=causal,
+            window_size=slide_size,
+            layout="bhsd",
+            training=True,
+            role="backward_dq",
+            batch_size=B,
+            query_length=N,
+            key_length=N,
+            image_groups=has_group_ids,
+            telemetry=ctx.selection_telemetry,
+        ).config
+        BLOCK_Q_BW = selected_dq.block_q
+        BLOCK_KV_BW = selected_dq.block_kv
+        num_warps_bw = selected_dq.num_warps
         BLOCK_Q_BW = min(BLOCK_Q_BW, triton.next_power_of_2(N))
         BLOCK_KV_BW = min(BLOCK_KV_BW, triton.next_power_of_2(N))
         grid_dq = (triton.cdiv(N, BLOCK_Q_BW), B * H_Q)
@@ -2274,7 +2339,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
-            num_warps=num_warps_bw, num_stages=2,
+            num_warps=num_warps_bw, num_stages=selected_dq.num_stages,
         )
 
         # --- dK, dV kernel (packed: KV-major, inline GQA Q-head loop) ---
@@ -2288,56 +2353,28 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         #
         # The old split path (_flash_attn_gqa_bwd_dkv_kernel with expand+reduce)
         # is kept in the source for reference but no longer on the hot path.
-        if D >= 512:
-            # Pack-GQA sweep @ N=4K Gemma4 (H_Q=32,H_KV=4): (BKV=16,BQ=64,w=4)
-            # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
-            # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
-            # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
-            num_stages_dkv = 2
-        else:
-            # D<512: (BKV=64, BQ=128, w=8, s=1) is the big-tile config that
-            # wins when grid is healthy. We use it in TWO regimes:
-            #   (a) grid_at_bkv64 >= 128: plain one-wave+ (Config A any N,
-            #       Config B long N) — QS=1 below.
-            #   (b) grid_at_bkv64 <= 16: extreme starve (Config B short N,
-            #       H_KV=1, N≤1K) — rely on QS=8 to hit ~128 programs; big
-            #       tile amortizes atomic cost. Sweep (2026-04-17,
-            #       `dkv_config_b_bkv64.py`) @ Config B N=1K:
-            #         (BKV=32,BQ=64,w=4,s=2,QS=8) = 0.153 ms
-            #         (BKV=64,BQ=128,w=8,s=1,QS=8) = 0.144 ms (-6%)
-            # Middle regime (grid_at_bkv64 in 32-64, Config B N=2K/4K): BKV=32
-            # with tighter QS to hit ~256 programs wins slightly.
-            grid_at_bkv64 = triton.cdiv(N, 64) * B * H_KV
-            if grid_at_bkv64 >= 128 or grid_at_bkv64 <= 16:
-                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 64, 128, 8
-                num_stages_dkv = 1
-            else:
-                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
-                num_stages_dkv = 2
+        selected_dkv = _resolve_attention_config(
+            q,
+            k,
+            causal=causal,
+            window_size=slide_size,
+            layout="bhsd",
+            training=True,
+            role="backward_dkv",
+            batch_size=B,
+            query_length=N,
+            key_length=N,
+            image_groups=has_group_ids,
+            telemetry=ctx.selection_telemetry,
+        ).config
+        BLOCK_KV_DKV = selected_dkv.block_kv
+        BLOCK_Q_DKV = selected_dkv.block_q
+        num_warps_dkv = selected_dkv.num_warps
+        num_stages_dkv = selected_dkv.num_stages
         BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))
         BLOCK_Q_DKV = min(BLOCK_Q_DKV, triton.next_power_of_2(N))
 
-        # Q_SPLITS: split each KV block's Q loop across multiple programs via
-        # atomic_add, activated when the raw grid < target. Target differs by
-        # BLOCK_KV (tuned 2026-04-17 in `dkv_config_b_bkv64.py`):
-        #   BKV=64 (big tile): target ≈ 128 programs (one wave), each program
-        #     has enough work to amortize atomic cost without needing 2 waves.
-        #   BKV=32 (small tile): target ≈ 256 programs (two waves), since
-        #     per-program work is halved and needs more parallelism.
-        # Atomic cost (GQA_RATIO × QS programs per dK/dV tile contending) is
-        # offset by better SM occupancy in low-grid regime. For healthy grids
-        # QS>1 is net-negative by ~5-15%.
-        raw_grid_dkv = triton.cdiv(N, BLOCK_KV_DKV) * B * H_KV
-        target_grid = 128 if BLOCK_KV_DKV == 64 else 256
-        if raw_grid_dkv >= target_grid:
-            Q_SPLITS_DKV = 1
-        elif raw_grid_dkv * 2 >= target_grid:
-            Q_SPLITS_DKV = 2
-        elif raw_grid_dkv * 4 >= target_grid:
-            Q_SPLITS_DKV = 4
-        else:
-            Q_SPLITS_DKV = 8
+        Q_SPLITS_DKV = selected_dkv.q_splits
 
         grid_dkv = (triton.cdiv(N, BLOCK_KV_DKV), B * H_KV, Q_SPLITS_DKV)
 
@@ -2430,30 +2467,23 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         output = torch.empty_like(q)
         lse = torch.empty(total_q, H_Q, dtype=torch.float32, device=q.device)
 
-        # Forward block sizes.
-        # H200 + Triton 3.2 shmem budget is 228 KB. Each (BQ, BKV) block
-        # footprint is roughly (BQ + 2 * num_stages * BKV) * HEAD_DIM * 2 bytes
-        # for the Q/K/V tiles plus the fp32 accumulator (BQ * D * 4). The
-        # batched kernel's original table (BQ=64/BKV=32 @ D=512, BQ=128/BKV=64
-        # @ D=256) was tuned against older Triton's looser accounting; Triton
-        # 3.2 reports 256-257 KB for those, just over the cap. Shrink:
-        #   D=512: BQ=32, BKV=32 (was BQ=64)
-        #   D=256: BQ=64, BKV=64 (was BQ=128) — keep larger BKV for HBM reuse
-        #   D<256: BQ=128, BKV=64 (fits easily)
-        # tl.dot requires tile dims ≥ 16, so clamp the floor to 16.
-        if D >= 512:
-            BLOCK_Q = 32
-            BLOCK_KV = 32
-            num_warps = 4
-        elif D >= 256:
-            BLOCK_Q = 64
-            BLOCK_KV = 64
-            num_warps = 4
-        else:
-            BLOCK_Q = 128
-            BLOCK_KV = 64
-            num_warps = 4
-        num_stages = 2
+        selected = _resolve_attention_config(
+            q,
+            k,
+            causal=causal,
+            window_size=slide_size,
+            layout="thd",
+            training=True,
+            role="forward",
+            batch_size=B,
+            query_length=max_seqlen_q,
+            key_length=max_seqlen_k,
+        ).config
+        BLOCK_Q = selected.block_q
+        BLOCK_KV = selected.block_kv
+        BLOCK_D = selected.block_d
+        num_warps = selected.num_warps
+        num_stages = selected.num_stages
         BLOCK_Q = max(16, min(BLOCK_Q, triton.next_power_of_2(int(max_seqlen_q))))
         BLOCK_KV = max(16, min(BLOCK_KV, triton.next_power_of_2(int(max_seqlen_k))))
 
@@ -2468,7 +2498,7 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             N_Q_HEADS=H_Q, N_KV_HEADS=H_KV,
             HEAD_DIM=D,
             scale=1.0 / math.sqrt(D),
-            BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, BLOCK_D=D,
+            BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
             IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
             LSE_ptr=lse, stride_lset=lse.stride(0), stride_lseh=lse.stride(1),
             STORE_LSE=True,
@@ -2481,6 +2511,7 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         ctx.causal = causal
         ctx.slide_size = slide_size
         ctx.H_KV = H_KV
+        ctx.selection_telemetry = get_active_attention_telemetry()
         return output
 
     @staticmethod
@@ -2503,10 +2534,22 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         dq = torch.empty_like(q)
 
         # --- dQ kernel ---
-        if D >= 512:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
-        else:
-            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
+        selected_dq = _resolve_attention_config(
+            q,
+            k,
+            causal=causal,
+            window_size=slide_size,
+            layout="thd",
+            training=True,
+            role="backward_dq",
+            batch_size=B,
+            query_length=max_seqlen_q,
+            key_length=max_seqlen_k,
+            telemetry=ctx.selection_telemetry,
+        ).config
+        BLOCK_Q_BW = selected_dq.block_q
+        BLOCK_KV_BW = selected_dq.block_kv
+        num_warps_bw = selected_dq.num_warps
         BLOCK_Q_BW = max(16, min(BLOCK_Q_BW, triton.next_power_of_2(max_seqlen_q)))
         BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(max_seqlen_k)))
         grid_dq = (triton.cdiv(max_seqlen_q, BLOCK_Q_BW), H_Q, B)
@@ -2527,34 +2570,31 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             BLOCK_Q=BLOCK_Q_BW, BLOCK_KV=BLOCK_KV_BW,
             IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
             STORE_DELTA=True,
-            num_warps=num_warps_bw, num_stages=2,
+            num_warps=num_warps_bw, num_stages=selected_dq.num_stages,
         )
 
         # --- dK/dV kernel (pack-GQA) ---
-        if D >= 512:
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
-            num_stages_dkv = 2
-        else:
-            grid_at_bkv64 = triton.cdiv(max_seqlen_k, 64) * B * H_KV
-            if grid_at_bkv64 >= 128 or grid_at_bkv64 <= 16:
-                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 64, 128, 8
-                num_stages_dkv = 1
-            else:
-                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
-                num_stages_dkv = 2
+        selected_dkv = _resolve_attention_config(
+            q,
+            k,
+            causal=causal,
+            window_size=slide_size,
+            layout="thd",
+            training=True,
+            role="backward_dkv",
+            batch_size=B,
+            query_length=max_seqlen_q,
+            key_length=max_seqlen_k,
+            telemetry=ctx.selection_telemetry,
+        ).config
+        BLOCK_KV_DKV = selected_dkv.block_kv
+        BLOCK_Q_DKV = selected_dkv.block_q
+        num_warps_dkv = selected_dkv.num_warps
+        num_stages_dkv = selected_dkv.num_stages
         BLOCK_KV_DKV = max(16, min(BLOCK_KV_DKV, triton.next_power_of_2(max_seqlen_k)))
         BLOCK_Q_DKV = max(16, min(BLOCK_Q_DKV, triton.next_power_of_2(max_seqlen_q)))
 
-        raw_grid_dkv = triton.cdiv(max_seqlen_k, BLOCK_KV_DKV) * B * H_KV
-        target_grid = 128 if BLOCK_KV_DKV == 64 else 256
-        if raw_grid_dkv >= target_grid:
-            Q_SPLITS_DKV = 1
-        elif raw_grid_dkv * 2 >= target_grid:
-            Q_SPLITS_DKV = 2
-        elif raw_grid_dkv * 4 >= target_grid:
-            Q_SPLITS_DKV = 4
-        else:
-            Q_SPLITS_DKV = 8
+        Q_SPLITS_DKV = selected_dkv.q_splits
 
         grid_dkv = (triton.cdiv(max_seqlen_k, BLOCK_KV_DKV), B * H_KV, Q_SPLITS_DKV)
 
@@ -2657,304 +2697,3 @@ def flash_attn_gqa_varlen(q, k, v,
         int(max_seqlen_q), int(max_seqlen_k),
         bool(causal), int(window_size),
     )
-
-
-# --- Benchmark ---
-if __name__ == "__main__":
-    from utils import benchmark, benchmark_fn
-    import sys
-    from functools import partial
-
-    def make_qkv(shape, dtype, device):
-        B, H, N, D = shape
-        q = torch.randn(B, H, N, D, dtype=dtype, device=device)
-        k = torch.randn(B, H, N, D, dtype=dtype, device=device)
-        v = torch.randn(B, H, N, D, dtype=dtype, device=device)
-        return (q, k, v)
-
-    def make_qkv_gqa(shape, dtype, device):
-        """shape = (B, H_Q, N, D, H_KV)"""
-        B, H_Q, N, D, H_KV = shape
-        q = torch.randn(B, H_Q, N, D, dtype=dtype, device=device)
-        k = torch.randn(B, H_KV, N, D, dtype=dtype, device=device)
-        v = torch.randn(B, H_KV, N, D, dtype=dtype, device=device)
-        return (q, k, v)
-
-    mode = sys.argv[1] if len(sys.argv) > 1 else "mha"
-
-    if mode == "gemma4":
-        # Gemma4 config: H_Q=32, H_KV=4, D=512
-        print("=== Gemma4 GQA Benchmark (H_Q=32, H_KV=4, D=512) ===")
-        benchmark(
-            implementations={
-                "pytorch_sdpa": attention_gqa_ref,
-                "flash_gqa": attention_flash_gqa,
-            },
-            input_shapes=[
-                # (B, H_Q, N, D, H_KV)
-                (1, 32, 128, 512, 4),
-                (1, 32, 256, 512, 4),
-                (1, 32, 512, 512, 4),
-                (1, 32, 1024, 512, 4),
-                (1, 32, 2048, 512, 4),
-                (1, 32, 4096, 512, 4),
-                (2, 32, 1024, 512, 4),
-                (2, 32, 2048, 512, 4),
-            ],
-            input_fn=make_qkv_gqa,
-            dtype=torch.float16,
-            device="cuda",
-            warmup=10,
-            rep=100,
-            verify=True,
-            atol=5e-2,
-            rtol=5e-2,
-        )
-
-    elif mode == "causal":
-        # Gemma4 causal attention benchmark
-        print("=== Gemma4 GQA Causal Benchmark (H_Q=32, H_KV=4, D=512) ===")
-        ref_causal = partial(attention_gqa_ref, causal=True)
-        triton_causal = partial(attention_flash_gqa, causal=True)
-        benchmark(
-            implementations={
-                "pytorch_sdpa_causal": ref_causal,
-                "flash_gqa_causal": triton_causal,
-            },
-            input_shapes=[
-                (1, 32, 128, 512, 4),
-                (1, 32, 256, 512, 4),
-                (1, 32, 512, 512, 4),
-                (1, 32, 1024, 512, 4),
-                (1, 32, 2048, 512, 4),
-                (1, 32, 4096, 512, 4),
-                (2, 32, 2048, 512, 4),
-            ],
-            input_fn=make_qkv_gqa,
-            dtype=torch.float16,
-            device="cuda",
-            warmup=10,
-            rep=100,
-            verify=True,
-            atol=5e-2,
-            rtol=5e-2,
-        )
-
-    elif mode == "long":
-        # Long sequence benchmark (Gemma4 non-causal + causal)
-        print("=== Gemma4 Long Sequence Benchmark (H_Q=32, H_KV=4, D=512) ===")
-        ref_causal = partial(attention_gqa_ref, causal=True)
-        triton_causal = partial(attention_flash_gqa, causal=True)
-        benchmark(
-            implementations={
-                "sdpa_causal": ref_causal,
-                "triton_causal": triton_causal,
-            },
-            input_shapes=[
-                (1, 32, 4096, 512, 4),
-                (1, 32, 8192, 512, 4),
-                (1, 32, 16384, 512, 4),
-            ],
-            input_fn=make_qkv_gqa,
-            dtype=torch.float16,
-            device="cuda",
-            warmup=5,
-            rep=20,
-            verify=True,
-            atol=5e-2,
-            rtol=5e-2,
-        )
-
-    elif mode == "bf16":
-        # BF16 benchmark
-        print("=== Gemma4 GQA BF16 Benchmark (H_Q=32, H_KV=4, D=512) ===")
-        benchmark(
-            implementations={
-                "pytorch_sdpa": attention_gqa_ref,
-                "flash_gqa": attention_flash_gqa,
-            },
-            input_shapes=[
-                (1, 32, 512, 512, 4),
-                (1, 32, 1024, 512, 4),
-                (1, 32, 2048, 512, 4),
-                (1, 32, 4096, 512, 4),
-            ],
-            input_fn=make_qkv_gqa,
-            dtype=torch.bfloat16,
-            device="cuda",
-            warmup=10,
-            rep=100,
-            verify=True,
-            atol=5e-2,
-            rtol=5e-2,
-        )
-
-    elif mode == "sweep":
-        # Sweep block sizes for Gemma4 to find best config
-        print("=== Block Size Sweep for Gemma4 (B=1, H_Q=32, H_KV=4, N=1024, D=512) ===")
-        shape = (1, 32, 1024, 512, 4)
-        args = make_qkv_gqa(shape, torch.float16, "cuda")
-        ref_out = attention_gqa_ref(*args)
-        ref_time = benchmark_fn(attention_gqa_ref, *args, warmup=10, rep=50)
-        print(f"PyTorch SDPA: {ref_time:.4f} ms\n")
-
-        configs = [
-            # (BLOCK_Q, BLOCK_KV, BLOCK_D, num_warps, num_stages)
-            (16, 32, 128, 4, 2),
-            (16, 32, 128, 4, 3),
-            (16, 32, 128, 8, 2),
-            (16, 64, 128, 4, 2),
-            (16, 64, 128, 4, 3),
-            (16, 64, 128, 8, 2),
-            (16, 64, 64, 4, 3),
-            (16, 64, 256, 4, 3),
-            (32, 32, 128, 4, 2),
-            (32, 32, 128, 8, 2),
-            (32, 64, 128, 4, 2),
-            (32, 64, 128, 8, 2),
-            (64, 32, 128, 4, 2),
-            (64, 64, 128, 4, 2),
-            (16, 128, 128, 4, 2),
-            (16, 128, 128, 8, 2),
-        ]
-        print(f"{'Config (BQ,BKV,BD,W,S)':<30} {'Time (ms)':>10} {'vs SDPA':>8} {'Correct':>8}")
-        print("-" * 60)
-        for bq, bkv, bd, nw, ns in configs:
-            try:
-                fn = partial(attention_flash_gqa,
-                             BLOCK_Q=bq, BLOCK_KV=bkv, BLOCK_D=bd,
-                             num_warps=nw, num_stages=ns)
-                out = fn(*args)
-                correct = torch.allclose(ref_out, out, atol=5e-2, rtol=5e-2)
-                t = benchmark_fn(fn, *args, warmup=10, rep=50)
-                ratio = ref_time / t
-                print(f"({bq:>2},{bkv:>3},{bd:>3},{nw},{ns})"
-                      f"{'':>16} {t:>10.4f} {ratio:>7.2f}x {'OK' if correct else 'FAIL':>8}")
-            except Exception as e:
-                print(f"({bq:>2},{bkv:>3},{bd:>3},{nw},{ns})"
-                      f"{'':>16} {'ERROR':>10} {str(e)[:40]}")
-
-    elif mode == "swa":
-        # Sliding Window Attention benchmark and correctness test.
-        # Gemma4 Sliding layer config: H_Q=32, H_KV=16, D=256, slide_size=1024
-        # (distinct from the full-attention layer config H_KV=4, D=512).
-        SLIDE = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
-        print(f"=== Gemma4 Sliding Attention (slide_size={SLIDE}, H_Q=32, H_KV=16, D=256) ===")
-        print()
-
-        # --- Correctness check ---
-        print("Correctness check:")
-        for N in [128, 256, 512, 1024, 2048, 4096]:
-            shape = (1, 32, N, 256, 16)
-            args = make_qkv_gqa(shape, torch.float16, "cuda")
-            ref_out = attention_swa_ref(*args, slide_size=SLIDE)
-            triton_out = attention_flash_gqa(*args, causal=True, slide_size=SLIDE)
-            ok = torch.allclose(ref_out, triton_out, atol=5e-2, rtol=5e-2)
-            max_err = (ref_out - triton_out).abs().max().item()
-            print(f"  N={N:>5}: {'OK' if ok else 'FAIL'} (max_err={max_err:.4f})")
-
-        print()
-
-        # --- Forward benchmark: SWA vs full causal vs SDPA ---
-        print("Forward benchmark:")
-        triton_causal = partial(attention_flash_gqa, causal=True)
-        triton_swa = partial(attention_flash_gqa, causal=True, slide_size=SLIDE)
-        sdpa_causal = partial(attention_gqa_ref, causal=True)
-        benchmark(
-            implementations={
-                "sdpa_causal":   sdpa_causal,
-                "triton_causal": triton_causal,
-                f"triton_swa_{SLIDE}": triton_swa,
-            },
-            input_shapes=[
-                (1, 32, 512,  256, 16),
-                (1, 32, 1024, 256, 16),
-                (1, 32, 2048, 256, 16),
-                (1, 32, 4096, 256, 16),
-                (1, 32, 8192, 256, 16),
-                (1, 32, 16384, 256, 16),
-            ],
-            input_fn=make_qkv_gqa,
-            dtype=torch.float16,
-            device="cuda",
-            warmup=10,
-            rep=30,
-            verify=False,
-        )
-
-        print()
-
-        # --- Backward correctness check ---
-        print("Backward correctness check (train mode):")
-        for N in [128, 256, 512, 1024, 2048]:
-            shape = (1, 32, N, 256, 16)
-            args_ref  = make_qkv_gqa(shape, torch.float16, "cuda")
-            args_tri  = [t.clone().requires_grad_(True) for t in args_ref]
-            args_ref  = [t.clone().requires_grad_(True) for t in args_ref]
-
-            ref_out = attention_swa_ref(*args_ref, slide_size=SLIDE)
-            ref_out.sum().backward()
-
-            tri_out = flash_attn_gqa_train(*args_tri, causal=True, slide_size=SLIDE)
-            tri_out.sum().backward()
-
-            dq_ok = torch.allclose(args_ref[0].grad, args_tri[0].grad, atol=1e-1, rtol=1e-1)
-            dk_ok = torch.allclose(args_ref[1].grad, args_tri[1].grad, atol=1e-1, rtol=1e-1)
-            dv_ok = torch.allclose(args_ref[2].grad, args_tri[2].grad, atol=1e-1, rtol=1e-1)
-            print(f"  N={N:>5}: dQ={'OK' if dq_ok else 'FAIL'} dK={'OK' if dk_ok else 'FAIL'} dV={'OK' if dv_ok else 'FAIL'}")
-
-    elif mode == "swa_bwd":
-        SLIDE = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
-        print("=== SWA Fwd+Bwd Benchmark (slide=%d, H_Q=32, H_KV=16, D=256) ===" % SLIDE)
-        print()
-
-        def sdpa_causal_fwd_bwd(q, k, v):
-            ratio = q.shape[1] // k.shape[1]
-            k_exp = k.repeat_interleave(ratio, dim=1)
-            v_exp = v.repeat_interleave(ratio, dim=1)
-            out = torch.nn.functional.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
-            out.sum().backward()
-            q.grad = k.grad = v.grad = None
-
-        def triton_swa_fwd_bwd(q, k, v):
-            out = flash_attn_gqa_train(q, k, v, causal=True, slide_size=SLIDE)
-            out.sum().backward()
-            q.grad = k.grad = v.grad = None
-
-        print("%6s | %16s | %15s | %8s" % ("N", "SDPA-causal (ms)", "Triton-SWA (ms)", "Speedup"))
-        print("-" * 56)
-        for N in [512, 1024, 2048, 4096, 8192]:
-            q = torch.randn(1, 32, N, 256, dtype=torch.float16, device="cuda").requires_grad_(True)
-            k = torch.randn(1, 16, N, 256, dtype=torch.float16, device="cuda").requires_grad_(True)
-            v = torch.randn(1, 16, N, 256, dtype=torch.float16, device="cuda").requires_grad_(True)
-            t_sdpa   = benchmark_fn(sdpa_causal_fwd_bwd, q, k, v, warmup=5, rep=20)
-            t_triton = benchmark_fn(triton_swa_fwd_bwd,  q, k, v, warmup=5, rep=20)
-            print("%6d | %16.3f | %15.3f | %7.2fx" % (N, t_sdpa, t_triton, t_sdpa/t_triton))
-
-    else:
-        # Original MHA benchmark
-        benchmark(
-            implementations={
-                "pytorch": attention,
-                "triton": attention_triton,
-                "triton_opt": attention_triton_opt,
-            },
-            input_shapes=[
-                # (B, H, N, D)
-                (1, 8, 128, 64),
-                (1, 8, 256, 64),
-                (1, 8, 512, 64),
-                (1, 8, 1024, 64),
-                (2, 8, 1024, 64),
-                (1, 8, 2048, 64),
-                (1, 8, 4096, 64),
-            ],
-            input_fn=make_qkv,
-            dtype=torch.float16,
-            device="cuda",
-            warmup=10,
-            rep=100,
-            verify=True,
-            atol=5e-2,
-            rtol=5e-2,
-        )

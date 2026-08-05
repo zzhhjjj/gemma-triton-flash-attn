@@ -134,7 +134,7 @@ supported; we had to rebuild tuples via `new_m_is = new_m_is + (new_max,)`
 inside the KV loop. That works but is another source of extra register
 pressure.
 
-Reproducer: `tests/test_grouped_forward.py`.
+Reproducer: `tests/legacy/test_grouped_forward.py`.
 
 ## ❌ Fused dQ + dKV backward (`_flash_attn_gqa_bwd_fused_kernel`)
 
@@ -163,7 +163,7 @@ There was also a transient shmem-budget issue at D=512 (BQ=32, BKV=32
 exceeded the 232 KB SM budget); reducing to BQ=16 fixed the launch failure
 but didn't help the atomic contention.
 
-Reproducer: `tests/test_fused_backward.py`.
+Reproducer: `tests/legacy/test_fused_backward.py`.
 
 ## ❌ Pipeline stages at D=512 forward (`num_stages ≥ 3`)
 

@@ -1,112 +1,90 @@
 # Architecture
 
-## Repository layout
+## 仓库结构
 
 ```
 flash_attn/
-  __init__.py            # public API exports
-  attention.py           # all Triton kernels + wrappers (fwd + bwd + SWA)
-  hf_integration.py      # HF attention adapter + register_triton_attention()
-  gemma4_e2e.py          # hand-built Gemma4-style stack benchmark (no HF)
-  utils.py               # benchmark utilities
+  attention.py       # production Triton kernels、autograd 与 public API
+  registry.py        # implementation/config selection
+  hf_integration.py  # HF、varlen 与 Ulysses adapter
+  performance.py     # benchmark 结果 schema
+  regression.py      # 性能回归规则
+  telemetry.py       # selection/fallback 记录
 
-tests/gemma4_integration/
-  test_adapter.py        # adapter unit test: GQA × SWA × D — no model download
-  test_adapter_multimodal.py # adapter + ContextVar + patch wiring (OR-mask path)
-  test_gemma4.py         # real google/gemma-4-E2B E2E test (correctness + perf)
-  test_memory.py         # peak memory benchmark: SDPA vs Triton, max context
-  README.md              # how to run the tests
-  pyproject.toml         # uv workspace member
-tests/
-  test_image_group_mask.py  # kernel fwd+bwd vs eager OR-mask reference
-  test_noncausal_vision_shape.py  # vision-encoder shapes (non-causal MHA)
-
-benchmarks/
-  run_final_benchmark.py # combined speed + memory benchmark
-  replot.py              # regenerate plots from cached results.json
-  results.json           # raw benchmark data
-  *.png                  # generated plots
-
-docs/                    # technical documentation
-context/baseline.md      # full quantitative history (internal)
-pyproject.toml           # package config (PyPI name: gemma-triton-flash-attn)
-requirements.txt         # integration test deps
+tests/               # 当前 pytest 门禁
+benchmarks/          # canonical benchmark 与待归档历史脚本
+benchmarks/history/  # 按硬件保存的历史复现入口
+exp/b200_speedup/    # B200 D512 原始证据与工作记录
 ```
 
-## Kernel structure in `flash_attn/attention.py`
+## Production kernel
 
-| Symbol | Role | Used in wrappers |
-|--------|------|------------------|
-| `_flash_attn_gqa_kernel` | Forward; `STORE_LSE` flag doubles as inference and training fwd; `HAS_GROUP_IDS` flag enables image-group OR-mask | ✅ always |
-| `_flash_attn_gqa_bwd_dq_kernel` | Backward dQ (one program per Q block, iterates KV); `HAS_GROUP_IDS` mirrors fwd | ✅ default bwd |
-| `_flash_attn_gqa_bwd_dkv_packed_kernel` | Backward dK/dV (pack-GQA style, no atomics); `HAS_GROUP_IDS` mirrors fwd | ✅ default bwd |
-| `_flash_attn_gqa_bwd_dkv_kernel` | Backward dK/dV (old split + reduce) | ⚪ kept for reference |
-| `_flash_attn_gqa_grouped_kernel` | Failed multi-head fusion fwd | ⚪ kept for reference |
-| `_flash_attn_gqa_bwd_fused_kernel` | Failed atomic fused bwd | ⚪ kept for reference |
-| `_delta_kernel` | Preprocess: computes `rowsum(dO * O)` for bwd | ✅ always |
-| `FlashAttnGQAFunction` | `torch.autograd.Function` tying fwd + bwd | ✅ training |
+| Symbol | 作用 | 状态 |
+| --- | --- | --- |
+| `_flash_attn_gqa_kernel` | batched forward | production |
+| `_flash_attn_gqa_varlen_fwd_kernel` | varlen forward | production |
+| `_flash_attn_gqa_bwd_dq_kernel` | batched dQ，prologue 同时计算 delta | production |
+| `_flash_attn_gqa_varlen_bwd_dq_kernel` | varlen dQ，prologue 同时计算 delta | production |
+| `_flash_attn_gqa_bwd_dkv_packed_kernel` | batched packed dK/dV | production |
+| `_flash_attn_gqa_varlen_bwd_dkv_packed_kernel` | varlen packed dK/dV | production |
+| `_delta_kernel` | 旧的独立 delta launch | 历史实验；production 不调用 |
+| grouped/fused/split/dV-only/dK-only kernels | 失败或被替代的结构 | 待连同复现脚本归档 |
 
-## Wrappers
-
-```python
-attention_flash_gqa(q, k, v, causal=False, slide_size=0)          # inference fwd
-flash_attn_gqa_train(q, k, v, causal=False, slide_size=0)         # training fwd (autograd)
-attention_gqa_ref / attention_swa_ref                              # eager PyTorch refs
-```
-
-## Data flow for training
+## 训练数据流
 
 ```
-user tensors (B, H_Q|H_KV, N, D)
-  → FlashAttnGQAFunction.forward
-      → _delta_kernel (precompute dO·O rowsum) [only on backward path]
-      → _flash_attn_gqa_kernel (STORE_LSE=True)     [forward]
-  → save for backward: q, k, v, o, lse
-  → loss.backward() triggers:
-      → _delta_kernel                               [now run with output]
-      → _flash_attn_gqa_bwd_dq_kernel               [dQ]
-      → _flash_attn_gqa_bwd_dkv_packed_kernel       [dK, dV, no atomics]
-  → return dq, dk, dv
+public API
+  → registry 选择 implementation 与 role config
+  → forward 保存 q/k/v/o/lse
+  → backward
+      → dQ kernel prologue 计算并保存 delta
+      → dQ
+      → packed dK/dV
 ```
 
-## Design choices
+production backward 不再单独启动 `_delta_kernel`。
 
-**Why pack-GQA for dK/dV, not dQ?**
-The GQA ratio is between Q heads and KV heads. For dQ, each Q has exactly one
-owning KV block, so there's no atomic contention — a plain split works.
-For dK/dV, each KV block is touched by `GQA_RATIO` Q heads, which without
-packing means `GQA_RATIO` programs contending on the same tile. Pack-GQA
-collapses those into one program with an internal `tl.static_range` loop.
+## 保留的设计结论
 
-**Why is the forward kernel shared between inference and training?**
-A single `STORE_LSE: tl.constexpr` flag switches whether the LSE output is
-emitted. Inference skips the HBM write (`~5%` faster); training needs it for
-the bwd pass. One compilation per (dtype, D, causal, slide) pair — two would
-be wasteful.
+- dQ 每个 Q head 只有一个 owning KV head，不需要 pack-GQA；
+- dK/dV 会被同一 GQA group 的多个 Q head 累积，packed kernel 用内部
+  `tl.static_range` 消除中间 expand buffer 与常规原子冲突；
+- forward 通过 `STORE_LSE` 区分 inference/training，训练保存 LSE，
+  inference 避免额外 HBM 写；
+- `torch.autograd.Function` 负责精确保存 q/k/v/o/lse，并让每次调用
+  明确经过 registry 选择。
 
-**Why autograd.Function instead of compile/torch.func?**
-We want deterministic kernel selection per call (D-aware block sizes), which
-doesn't play nicely with torch.compile's shape polymorphism. The Function
-wrapper also lets us save exactly the tensors needed (q, k, v, o, lse) with
-zero copy.
+H100 早期 wrapper tuning 结论也保留，但不等同于当前 compile-safe base：
 
-## Block sizes
-
-Block sizes are chosen per D to fit shared memory on H100 (228 KB usable):
-
-| D | BQ (fwd) | BKV (fwd) | BQ (bwd dQ) | BKV (bwd dKV) |
-|---|----------|-----------|-------------|---------------|
-| 64 / 96 / 128 | 128 | 64 | 64 | 64 |
+| D | BQ (fwd) | BKV (fwd) | BQ (dQ) | BKV (dKV) |
+| ---: | ---: | ---: | ---: | ---: |
+| 64/96/128 | 128 | 64 | 64 | 64 |
 | 256 | 128 | 64 | 64 | 64 |
 | 512 | 64 | 32 | 32 | 32 |
 
-Larger D forces smaller tiles because shared memory is ~`(BQ + 2·BKV) × D`
-fp16 bytes + fp32 accumulators.
+H100 D512 production shape 的历史 sweep 结论为
+`BQ=64, BKV=32, warps=8, stages=2`；对应脚本
+`benchmarks/d512_prod_tune.py`。这些值保留用于 H100 复认证，不覆盖
+H200 安全基线或 B200 override。
 
-These defaults were re-tuned at the production D=512 shapes (E2B
-H_Q=8 H_KV=1 and MoE H_Q=16 H_KV=8) — `BQ=64 BKV=32 num_warps=8 num_stages=2`
-remains the local optimum on H100. Sweep:
-[`benchmarks/d512_prod_tune.py`](../benchmarks/d512_prod_tune.py).
+## 跨硬件配置层级
+
+```
+sm90 compile-safe base
+├── H100 batched forward tuned override（历史 tuning，待复认证）
+└── H200 使用安全基线（尚无独立 tuned override）
+
+sm100 compile-safe base
+└── B200 varlen D512 dKV tuned override（已验证）
+```
+
+- H100/H200/B200 的实现与证据都保留；
+- 历史性能表、负面实验和软件栈限制也必须保留；只允许改变“当前/历史”标签；
+- B200 结果不得覆盖 `sm90`；
+- base 负责 compile-safe，product override 必须有对应实机与软件栈证据；
+- 未识别产品使用 base，不猜测复用 tuned config。
+
+当前 B200 D512 override 为 BQ16/BKV16/warps4/stages2/Q_SPLITS1；完整证据见 `exp/b200_speedup/results.md`。H100 性能表属于历史数据，H200 尚待重新认证。
 
 ## Target model attention shapes
 

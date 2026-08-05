@@ -94,32 +94,59 @@ from different samples **never** write to the same packed row. The only
 atomic contention is within a single sample's (kv_h, Q_SPLITS) cohort —
 identical to the batched kernel.
 
-## Test commands (on H200, varlen-fa conda env)
+## 当前测试
 
 ```bash
-# Correctness: fwd + bwd vs per-sample SDPA, plus equal-length equivalence vs batched
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_varlen_numerics.py --run-gpu
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_semantic_invariants.py --run-gpu
+```
+
+这两个 pytest 文件是当前门禁，覆盖 output/dQ/dK/dV、不同长度分布、边界和语义不变量。资源不足不得转换为 required case 的成功。
+
+`tests/test_varlen_correctness.py`、`test_varlen_edge_cases.py` 和 `test_varlen_scaling.py` 是 H200/Triton 3.2 阶段历史脚本；`test_varlen_vs_flash_attn.py` 尚未实现实际 oracle 断言，均不属于当前门禁。
+
+## 当前 benchmark
+
+```bash
+python benchmarks/benchmark_varlen_registry.py \
+  --profile gemma4_e2b_text_full \
+  --lengths 2048,2048,2048,2048 \
+  --phase forward_backward \
+  --dtype bfloat16
+```
+
+该入口走 production public API 与 registry，先验证同语义 PyTorch reference，再保存 selection、latency 分布、MFU 和环境。旧 `bench_varlen.py` 及其 JSON 只保留为 H200 历史证据。
+
+## H200 历史结论（保留）
+
+以下结果来自 H200、Torch 2.6.0+cu124、Triton 3.2.0 的 `varlen-fa`
+环境。它们不是当前 release gate，也不能外推到 H100/B200，但仍是 H200
+实现与调优的重要证据。
+
+历史测试命令：
+
+```bash
 python tests/test_varlen_correctness.py
-
-# Edge cases (single-token, skewed [1,1,1,N], etc.)
 python tests/test_varlen_edge_cases.py
-
-# Oracle against upstream flash-attn (skips if not importable — see test docstring)
 python tests/test_varlen_vs_flash_attn.py
 ```
 
-Expected on a clean env: all three scripts exit 0.
+`test_varlen_correctness.py` 覆盖 forward/backward 对 per-sample SDPA，
+以及 equal-length packed 与 batched kernel 的等价性；后者要求 fp32 cosine
+>0.99999，是当时最紧的诊断。需要保留两个已知限制：
 
-## Benchmark command
+- D256/D512 遇到 Triton shared-memory OutOfResources 时，旧脚本会记为 skip；
+- `test_varlen_vs_flash_attn.py` 的 upstream oracle 比较没有真正实现，
+  找到或找不到 upstream 模块都会返回 0。
+
+历史 benchmark 命令：
 
 ```bash
-# Quick smoke (3 configs)
 python benchmarks/bench_varlen.py --quick
-
-# Full sweep: (D, GQA, total_tokens) combos, JSON output
 python benchmarks/bench_varlen.py --out benchmarks/varlen_bench.json
 ```
 
-Sample output (H200, Triton 3.2, Zipf-distributed lengths):
+H200、Triton 3.2、Zipf 长度分布的保存结果：
 
 ```
  D  H_Q:H_KV   B   total   maxN  pad%  varlen ms  padded ms   speedup
@@ -131,25 +158,27 @@ Sample output (H200, Triton 3.2, Zipf-distributed lengths):
 512    32:4    4    4096   2451   58%      2.329      7.616     3.27×
 ```
 
-## v1 limitations
+当时的结论是：varlen 收益随 padding waste 增长，D128 在 85%+ padding
+waste 下可达到约 10×，保存的极端 cell 达到 24.76×。
 
-- **Text-only.** No image-group OR-mask (Gemma-4 multimodal vision-bidirectional
-  path stays in the batched kernel only).
-- **Same Q/K packing.** `cu_seqlens_q == cu_seqlens_k` required. Cross-attention
-  with different packings is a v2 extension.
-- **Hooks into HF adapter are intentionally absent.** HF's
-  `ALL_ATTENTION_FUNCTIONS` interface doesn't pass `cu_seqlens` through, so
-  varlen is exposed as a standalone training API. Callers that need varlen
-  inside HF models should build Q/K/V at the model-forward boundary and call
-  `flash_attn_gqa_varlen` directly.
-- **H200 + Triton 3.2 tuning.** v1 uses a conservative block-size table that
-  fits Triton 3.2's 228 KB shmem cap on H200 (stricter accounting than Triton
-  3.0-3.1):
-    - D=128: `BQ=128, BKV=64, w=4, s=2`
-    - D=256: `BQ=64,  BKV=64, w=4, s=2`   (was BQ=128 on older Triton)
-    - D=512: `BQ=32,  BKV=32, w=4, s=2`   (was BQ=64 on older Triton)
-  Expected ~10–20% slower than the H100 peak on D=256/D=512; a full sweep
-  (especially larger BKV at D=128 given H200's 4.8 TB/s HBM) is a follow-up.
+H200/Triton 3.2 为适配 228 KB shared-memory 上限采用的保守表：
+
+- D128：`BQ=128, BKV=64, w=4, s=2`；
+- D256：`BQ=64, BKV=64, w=4, s=2`，旧 Triton 曾使用 BQ128；
+- D512：`BQ=32, BKV=32, w=4, s=2`，旧 Triton 曾使用 BQ64。
+
+当时估计 D256/D512 比 H100 peak 慢约 10–20%，并记录了后续需要在
+H200 4.8 TB/s HBM 上重扫 D128 BKV。当前 registry 的 `sm90` base 是
+compile-safe 口径，不表示这些历史 tuning 已完成新软件栈复认证。
+
+## 支持范围
+
+- v1 要求 `cu_seqlens_q == cu_seqlens_k`；
+- kernel 本身不支持 image-group OR-mask；
+- HF integration 已提供 `triton_gqa_varlen_attention`、注册函数和 Ulysses varlen adapter，不再是“完全没有 HF hook”；
+- `sm90` 保留 H100/H200 compile-safe base；H200 尚无独立 tuned override；
+- `sm100` 保留安全 base，B200 varlen D512 dKV 使用已验证 product override；
+- 各硬件性能结论必须在对应实机重新采集，不能复用旧 H200 或 B200 数字。
 
 ## Source
 

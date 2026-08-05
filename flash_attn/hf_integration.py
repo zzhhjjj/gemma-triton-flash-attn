@@ -28,6 +28,7 @@ from typing import NamedTuple
 import torch
 
 from .attention import flash_attn_gqa_train
+from .telemetry import record_attention_fallback
 
 
 # =====================================================================
@@ -344,6 +345,11 @@ def triton_gqa_varlen_attention(
             state = (cu, max_sl)
 
     if state is None:
+        record_attention_fallback(
+            "triton_gqa_varlen",
+            "triton_gqa",
+            "no_varlen_metadata",
+        )
         return triton_gqa_attention(module, query, key, value, attention_mask,
                                     dropout=dropout, scaling=scaling,
                                     softcap=softcap, sliding_window=sliding_window,

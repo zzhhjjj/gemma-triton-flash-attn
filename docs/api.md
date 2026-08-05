@@ -26,6 +26,36 @@ Monkey-patches `transformers.utils.import_utils.PACKAGE_DISTRIBUTION_MAPPING`
 to fix the `KeyError: 'flash_attn'` bug in transformers 5.5.4. No-op on
 other versions. Call once, before any config load.
 
+### `capture_attention_selection(mode="summary", labels=None)`
+
+Opt-in context manager for process-local registry observability. It does not
+print or upload automatically. The yielded `AttentionSelectionTelemetry`
+supports `snapshot()`, `to_json()`, `format_summary()`, and `reset()`.
+
+```python
+from gemma_triton_flash_attn import capture_attention_selection
+
+with capture_attention_selection("summary") as telemetry:
+    output = model(input_ids)
+
+print(telemetry.format_summary())
+```
+
+Use `mode="debug"` only for short diagnostic runs when full candidate rejection
+reasons are needed. FSDP processes collect independent per-rank snapshots.
+
+## Performance metrics and provenance
+
+The package exports pure metric helpers including `attention_pair_count`,
+`attention_flops`, `achieved_tflops`, `mfu_percent`, `latency_summary`, and
+`resolve_hardware_peak`. Runtime/source collectors are available as
+`collect_runtime_metadata` and `collect_git_metadata`.
+
+These helpers do not affect kernel dispatch. Product peak lookup is strict and
+uses dense, not sparse, Tensor Core throughput. See
+[`performance.md`](performance.md) for the FLOPs convention, canonical
+benchmark, immutable result format, and regression gate.
+
 ## Direct kernel API (skip transformers)
 
 ### `attention_flash_gqa(q, k, v, causal=False, slide_size=0) -> out`

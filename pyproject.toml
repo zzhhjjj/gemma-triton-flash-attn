@@ -42,3 +42,25 @@ gemma_triton_flash_attn = "flash_attn"
 members = [
     "tests/gemma4_integration",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    "tests/gemma4_integration",
+    "tests/legacy",
+]
+addopts = [
+    "--strict-markers",
+    "--ignore=tests/test_packed_dkv.py",
+    "--ignore=tests/test_varlen_correctness.py",
+    "--ignore=tests/test_varlen_edge_cases.py",
+    "--ignore=tests/test_varlen_scaling.py",
+    "--ignore=tests/test_varlen_vs_flash_attn.py",
+]
+markers = [
+    "gpu: requires a CUDA GPU and may JIT-compile Triton kernels",
+    "integration: requires optional framework/model dependencies",
+    "distributed: requires a multi-process distributed launch",
+    "slow: takes more than the fast correctness budget",
+    "performance: measures latency, throughput, memory, or profiler signals",
+]

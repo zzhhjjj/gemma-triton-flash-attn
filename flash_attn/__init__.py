@@ -66,6 +66,30 @@ from .hf_integration import (
     patch_gemma4_shared_kv_states_for_fsdp2,
     patch_gemma4_image_group_ids_for_kernel,
 )
+from .profiles import DEFAULT_MODEL_PROFILES, ModelAttentionProfile, ModelProfileRegistry
+from .registry import (
+    AttentionKernelRegistry,
+    AttentionSpec,
+    DEFAULT_REGISTRY,
+    KernelConfig,
+    RuntimeSpec,
+)
+from .telemetry import AttentionSelectionTelemetry, capture_attention_selection
+from .performance import (
+    HARDWARE_PEAKS,
+    HardwarePeak,
+    UnknownHardwarePeak,
+    achieved_tflops,
+    attention_flops,
+    attention_pair_count,
+    collect_git_metadata,
+    collect_runtime_metadata,
+    latency_summary,
+    mfu_percent,
+    resolve_hardware_peak,
+    varlen_attention_flops,
+    varlen_rectangular_grid_stats,
+)
 
 __version__ = "0.1.0"
 
@@ -85,9 +109,40 @@ __all__ = [
     # HF transformers integration
     "register_triton_attention",
     "register_triton_attention_ulysses",
+    "register_triton_attention_varlen",
+    "register_triton_attention_varlen_ulysses",
     "triton_gqa_attention",
+    "triton_gqa_varlen_attention",
+    "set_varlen_cu_seqlens",
+    "clear_varlen_cu_seqlens",
+    "cu_seqlens_from_2d_indices",
     "patch_transformers_5_5_4_flash_attn_key",
     "patch_gemma4_shared_kv_states_for_fsdp2",
     "patch_gemma4_image_group_ids_for_kernel",
+    # Registry and model-profile contracts
+    "AttentionSpec",
+    "RuntimeSpec",
+    "KernelConfig",
+    "AttentionKernelRegistry",
+    "DEFAULT_REGISTRY",
+    "ModelAttentionProfile",
+    "ModelProfileRegistry",
+    "DEFAULT_MODEL_PROFILES",
+    "AttentionSelectionTelemetry",
+    "capture_attention_selection",
+    # Performance metrics and provenance (does not affect kernel dispatch)
+    "HardwarePeak",
+    "HARDWARE_PEAKS",
+    "UnknownHardwarePeak",
+    "attention_pair_count",
+    "attention_flops",
+    "achieved_tflops",
+    "mfu_percent",
+    "latency_summary",
+    "resolve_hardware_peak",
+    "collect_runtime_metadata",
+    "collect_git_metadata",
+    "varlen_attention_flops",
+    "varlen_rectangular_grid_stats",
     "__version__",
 ]

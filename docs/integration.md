@@ -118,8 +118,37 @@ Verified by `tests/test_image_group_mask.py` (kernel fwd+bwd vs eager OR-mask re
 
 ## Verifying the adapter is actually hit
 
-`test_gemma4.py` wraps the registered function with a call counter and asserts
-it's invoked exactly once per attention layer per forward. On Gemma-4-E2B (35
-layers: 7 full + 28 sliding), a single forward yields 35 adapter calls — if
-SWA or some other code path were silently falling back to SDPA, the count
-would drop.
+Registry selection telemetry can verify the selected implementation and config
+without printing from the attention hot path or sending data anywhere:
+
+```python
+from gemma_triton_flash_attn import capture_attention_selection
+
+with capture_attention_selection(
+    "summary", labels={"model_profile": "gemma4_e2b"}
+) as telemetry:
+    out = model(input_ids)
+    out.loss.backward()  # include this line to count backward roles
+
+print(telemetry.format_summary())
+snapshot = telemetry.snapshot()  # JSON-compatible dict
+assert snapshot["total_fallbacks"] == 0
+```
+
+`summary` aggregates calls by role, config, hardware, and attention semantics.
+`debug` additionally retains the full immutable spec/runtime plus accepted and
+rejected registry candidates once per distinct selection. Debug mode is meant
+for short diagnosis runs because dynamic shapes can create more distinct
+records.
+
+Telemetry is opt-in and process-local. Under FSDP, every rank owns an
+independent recorder; callers should either compare the per-rank snapshots or
+write them to rank-qualified paths. The varlen adapter explicitly records its
+route to batched Triton when packing metadata is missing. A model configured to
+use SDPA never enters this adapter, so release tests must also assert the
+expected total attention-call count.
+
+`test_gemma4.py` currently wraps the registered function with a call counter
+and asserts it is invoked exactly once per attention layer per forward. On
+Gemma-4-E2B (35 layers: 7 full + 28 sliding), a single forward yields 35 adapter
+calls; telemetry is the durable replacement for that ad-hoc counter.

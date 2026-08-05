@@ -9,17 +9,28 @@ the eager reference at MoE-realistic shapes.
 
 Run: pytest tests/test_image_group_mask.py -v
 """
-import os
-import sys
-
 import pytest
 import torch
-import torch.nn.functional as F
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flash_attn.attention import flash_attn_gqa_train, attention_flash_gqa
 from flash_attn.hf_integration import _compute_image_group_state
+from tests.numerics import Tolerance, assert_close
+
+
+pytestmark = pytest.mark.gpu
+
+OUTPUT_TOLERANCE = Tolerance(
+    cosine_min=0.9999,
+    max_abs=2e-2,
+    mean_abs=5e-4,
+    relative_l2=2e-2,
+)
+GRAD_TOLERANCE = Tolerance(
+    cosine_min=0.9999,
+    max_abs=1.5e-1,
+    mean_abs=2e-3,
+    relative_l2=3e-2,
+)
 
 
 def make_groups(B, N, image_spans):
@@ -97,10 +108,11 @@ def test_fwd_image_group_or_mask(B, H_Q, H_KV, N, D, slide, spans):
         group_hi_excl=state.group_hi_excl,
     )
 
-    diff = (ref.float() - out.float()).abs()
-    # bf16 ULP near 1.0 is 2^-6 = 1.56e-2; tolerate one rounding step.
-    assert diff.max().item() < 2e-2 and diff.mean().item() < 5e-4, (
-        f"max|Δ|={diff.max().item():.2e} mean|Δ|={diff.mean().item():.2e}"
+    assert_close(
+        out,
+        ref,
+        name=f"image_group_forward/B={B}/H={H_Q}:{H_KV}/N={N}/D={D}",
+        tolerance=OUTPUT_TOLERANCE,
     )
 
 
@@ -138,9 +150,11 @@ def test_bwd_image_group_or_mask(B, H_Q, H_KV, N, D, slide, spans):
     for name, ours, theirs in [("dq", q.grad, qr.grad),
                                 ("dk", k.grad, kr.grad),
                                 ("dv", v.grad, vr.grad)]:
-        d = (ours.float() - theirs.float()).abs()
-        assert d.max().item() < 1.5e-1, (
-            f"{name}: max|Δ|={d.max().item():.2e} mean|Δ|={d.mean().item():.2e}"
+        assert_close(
+            ours,
+            theirs,
+            name=f"image_group_{name}/H={H_Q}:{H_KV}/N={N}/D={D}",
+            tolerance=GRAD_TOLERANCE,
         )
 
 
@@ -168,8 +182,3 @@ def test_no_image_path_unchanged():
     # be bit-identical.
     assert torch.equal(out_no_groups, out_with_groups), \
         "all-text group_ids changed output"
-
-
-if __name__ == "__main__":
-    import subprocess
-    sys.exit(subprocess.call(["pytest", __file__, "-v"]))

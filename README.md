@@ -13,6 +13,13 @@ same Q/K/V tensors and only the head counts / window size differ.
 
 ## Results at a glance (H100, single GPU)
 
+> **Historical evidence, pending canonical recertification.** These H100
+> numbers predate the GPU/model registry and provenance-complete benchmark.
+> Some old benchmark scripts also paired sliding Triton work with a full-causal
+> SDPA timing, so no table below should be used as a current B200 claim or a
+> registry-promotion gate. The raw results are retained to avoid losing useful
+> experiments; new claims must use [`docs/performance.md`](docs/performance.md).
+
 | Benchmark | Config | Peak speedup / saving |
 |-----------|--------|-----------------------|
 | **Kernel fwd** (full causal, D=512, GQA 8:1) | N=32K, FP16 | **2.18× vs SDPA** |

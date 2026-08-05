@@ -40,6 +40,9 @@ Thumbs.db
 # context/
 # skills/
 
+# experiment outputs
+exp
+
 # Profiling output
 *.nsys-rep
 *.sqlite
