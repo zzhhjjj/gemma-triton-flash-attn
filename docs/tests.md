@@ -10,9 +10,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q --run-gpu
 ```
 
-最近一次 e051 结果：CPU 100 passed、50 skipped；B200 GPU 50/50 passed。
-其中新增 12 个 H200 registry selection 防回退 case。H100/H200 实机性能
-仍需在对应硬件重新认证，不能把 B200 结果当作跨硬件认证。
+最近一次e331结果：CPU 150 passed、50 skipped；B200 GPU完整门禁
+200/200 passed，GPU1–7各额外复测varlen 8/8。H100/H200 registry selection
+合同通过；实机性能仍需在对应硬件重新认证，不能把B200结果当作跨硬件认证。
 
 GPU 覆盖：
 

@@ -5,7 +5,7 @@
 | 用途 | 入口 | 说明 |
 | --- | --- | --- |
 | batched canonical | `benchmark_registry.py` | 走 public API 与 registry，先做同语义正确性，再记录 latency/MFU/selection |
-| varlen canonical | `benchmark_varlen_registry.py` | packed/cu_seqlens 正式性能入口 |
+| varlen canonical | `benchmark_varlen_registry.py` | packed/cu_seqlens 正式入口；记录正确性、吞吐、显存峰值与 selection |
 | 结果回归 | `compare_registry_results.py` | 严格匹配 cell，检查缺失、正确性和性能退化 |
 | NCU/NSYS target | `profile_varlen_target.py` | 只 profile registry 实际选择的 production path |
 | B200 D512 候选复现 | `probe_varlen_d512_candidate.py` | candidate-only；不是 production benchmark |
@@ -26,13 +26,25 @@ python benchmarks/benchmark_varlen_registry.py \
   --dtype bfloat16
 ```
 
-正式结论必须同时保存 GPU/软件栈、git dirty 状态、registry selection、正确性、原始样本和分位数；不同硬件或提交不得覆盖旧结果。
+Backward 大梯度范围可用 `--grad-output-scale` 压测；绝对误差门槛会随尺度线性调整。
+
+正式结论必须同时保存 GPU/软件栈、git dirty 状态、registry selection、正确性、
+原始样本、分位数和增量峰值 allocated/reserved；不同硬件或提交不得覆盖旧结果。
 
 ## 三代硬件资产
 
 - H100：保留历史 tuning 脚本、JSON/PNG 和 product override。旧的内嵌 benchmark 已迁到 `history/h100/attention_embedded_benchmark.py`。
 - H200：保留 varlen 早期实现、测试和结果；当前 production 使用 `sm90` compile-safe base，尚未形成独立 tuned override。
-- B200：当前 canonical 证据位于 `exp/b200_speedup/`，D512 production 六个 workload 为 1.927–3.144× SDPA。
+- B200：当前 canonical 证据位于 `exp/b200_speedup/`。stage3+qsplit production 的
+  D512 单序列 2K–256K 均超过 1.5× SDPA；E2B 2K 已到 4.33×。固定总长 256K 的不同 packed
+  分布为 2.39–8.38×。E2B/MoE 256K 峰值显存约为 SDPA 的 22.5%；B200
+  qsplit 独立 scratch 与提前释放 delta 使 BF16 8K 峰值下降 4.67%。FP16
+  qsplit 进一步使用同 dtype scratch，峰值约再降14%，full F+B 快1.3%–5.7%；
+  BF16 E2B full batch1 当前使用 head-grid：raw32–67为q3+FP32 scratch，
+  raw68–105为q2/w4+BF16x2，raw106–536为q1+BF16x2；
+  MoE BF16 2K 使用 q14/w8，其他 raw64–95 使用 q8/w8、96–127 使用 q4/w8。
+  FP16 保留 E2B raw32 q13 与 MoE raw64–71 q9。forward BKV64 仅覆盖已验证的 E2B
+  raw32–240 与 MoE raw64–96；packed、sliding 和更长区间保持原配置。
 - 失败实验：grouped forward、fused backward、split dKV 等必须连同复现脚本保留，但不再作为生产门禁。
 
 当前根目录仍有一批 H100/H200 历史脚本，后续会按硬件移动；移动前不删除，不把旧数字当作跨硬件结论。
@@ -72,10 +84,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q --run-gpu
 ```
 
-截至 e051 防回退门禁：CPU 100 passed、50 skipped；B200 GPU 50/50；
-D512 六个 production cell 为 1.946–3.095× SDPA，且相对 e042 的 Triton
-median 最大绝对变化 0.71%。H100/H200 需要在对应实机重新认证，不能复用
-B200 结果。
+截至 e331：CPU 150 passed、50 skipped；B200 GPU 完整门禁 200/200，GPU
+1–7 各另复测 varlen 8/8。单序列 head-grid/qsplit、BF16x2 scratch、packed
+防回退与2K–256K矩阵均正确。
+H100/H200 需要在对应实机重新认证，
+不能复用 B200 结果。
 
 ## 历史脚本规则
 

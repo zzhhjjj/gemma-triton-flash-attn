@@ -76,6 +76,10 @@ class AttentionSelectionTelemetry:
             resolution.config.num_warps,
             resolution.config.num_stages,
             resolution.config.q_splits,
+            resolution.config_registration.separate_dkv_scratch,
+            resolution.config_registration.relaxed_dkv_atomics,
+            resolution.config_registration.split_gqa_heads,
+            resolution.config_registration.bf16x2_dkv_atomics,
         )
 
     @staticmethod
@@ -103,6 +107,10 @@ class AttentionSelectionTelemetry:
             "num_warps",
             "num_stages",
             "q_splits",
+            "separate_dkv_scratch",
+            "relaxed_dkv_atomics",
+            "split_gqa_heads",
+            "bf16x2_dkv_atomics",
         )
         return {"count": count, **dict(zip(names, key))}
 

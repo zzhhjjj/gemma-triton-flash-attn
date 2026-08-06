@@ -213,9 +213,18 @@ class ConfigRegistration:
     gpu_name_patterns: frozenset[str] = frozenset()
     torch_version_prefixes: frozenset[str] = frozenset()
     triton_version_prefixes: frozenset[str] = frozenset()
+    batch_sizes: frozenset[int] = frozenset()
+    q_head_counts: frozenset[int] = frozenset()
+    kv_head_counts: frozenset[int] = frozenset()
+    window_sizes: frozenset[int] = frozenset()
+    min_query_length: int | None = None
     grid_probe_block_kv: int | None = None
     grid_ranges: tuple[tuple[int | None, int | None], ...] = ()
     q_split_target: int | None = None
+    separate_dkv_scratch: bool = False
+    relaxed_dkv_atomics: bool = False
+    split_gqa_heads: bool = False
+    bf16x2_dkv_atomics: bool = False
 
     def rejection_reasons(
         self,
@@ -258,6 +267,18 @@ class ConfigRegistration:
             reasons.append(
                 f"triton_version={runtime.triton_version} does not match "
                 f"{sorted(self.triton_version_prefixes)}"
+            )
+        if self.batch_sizes and spec.batch_size not in self.batch_sizes:
+            reasons.append(f"batch_size={spec.batch_size} not in {sorted(self.batch_sizes)}")
+        if self.q_head_counts and spec.q_heads not in self.q_head_counts:
+            reasons.append(f"q_heads={spec.q_heads} not in {sorted(self.q_head_counts)}")
+        if self.kv_head_counts and spec.kv_heads not in self.kv_head_counts:
+            reasons.append(f"kv_heads={spec.kv_heads} not in {sorted(self.kv_head_counts)}")
+        if self.window_sizes and spec.window_size not in self.window_sizes:
+            reasons.append(f"window_size={spec.window_size} not in {sorted(self.window_sizes)}")
+        if self.min_query_length is not None and spec.query_length < self.min_query_length:
+            reasons.append(
+                f"query_length={spec.query_length} < min_query_length={self.min_query_length}"
             )
         if self.grid_ranges:
             probe_block = self.grid_probe_block_kv or self.config.block_kv
@@ -323,6 +344,10 @@ class Resolution:
             "config_id": self.config_registration.id,
             "config": asdict(self.config),
             "config_kind": self.config_registration.config_kind,
+            "separate_dkv_scratch": self.config_registration.separate_dkv_scratch,
+            "relaxed_dkv_atomics": self.config_registration.relaxed_dkv_atomics,
+            "split_gqa_heads": self.config_registration.split_gqa_heads,
+            "bf16x2_dkv_atomics": self.config_registration.bf16x2_dkv_atomics,
             "evidence_status": self.config_registration.evidence_status,
             "evidence": self.config_registration.evidence,
             "implementation_candidates": [asdict(item) for item in self.implementation_candidates],
@@ -475,12 +500,22 @@ def build_default_registry() -> AttentionKernelRegistry:
         training_modes: frozenset[bool],
         config_kind: ConfigKind = "base",
         priority: int = 0,
+        dtypes: frozenset[str] = frozenset(),
         gpu_name_patterns: frozenset[str] = frozenset(),
         evidence_status: EvidenceStatus | None = None,
         evidence: str | None = None,
         grid_ranges: tuple[tuple[int | None, int | None], ...] = (),
         grid_probe_block_kv: int | None = None,
         q_split_target: int | None = None,
+        batch_sizes: frozenset[int] = frozenset(),
+        q_head_counts: frozenset[int] = frozenset(),
+        kv_head_counts: frozenset[int] = frozenset(),
+        window_sizes: frozenset[int] = frozenset(),
+        min_query_length: int | None = None,
+        separate_dkv_scratch: bool = False,
+        relaxed_dkv_atomics: bool = False,
+        split_gqa_heads: bool = False,
+        bf16x2_dkv_atomics: bool = False,
     ) -> None:
         b200_verified = arch == "sm100" and (
             implementation_id == "triton_gqa_batched_v1" or head_dim != 64
@@ -510,6 +545,7 @@ def build_default_registry() -> AttentionKernelRegistry:
                 config_kind=config_kind,
                 role=role,
                 priority=priority,
+                dtypes=dtypes,
                 training_modes=training_modes,
                 gpu_name_patterns=gpu_name_patterns,
                 torch_version_prefixes=(
@@ -518,9 +554,18 @@ def build_default_registry() -> AttentionKernelRegistry:
                 triton_version_prefixes=(
                     frozenset({"3.6"}) if arch == "sm100" else frozenset()
                 ),
+                batch_sizes=batch_sizes,
+                q_head_counts=q_head_counts,
+                kv_head_counts=kv_head_counts,
+                window_sizes=window_sizes,
+                min_query_length=min_query_length,
                 grid_ranges=grid_ranges,
                 grid_probe_block_kv=grid_probe_block_kv,
                 q_split_target=q_split_target,
+                separate_dkv_scratch=separate_dkv_scratch,
+                relaxed_dkv_atomics=relaxed_dkv_atomics,
+                split_gqa_heads=split_gqa_heads,
+                bf16x2_dkv_atomics=bf16x2_dkv_atomics,
             )
         )
 
@@ -616,7 +661,11 @@ def build_default_registry() -> AttentionKernelRegistry:
 
     # B200 varlen D512 dKV: e030 selected BQ16, e031/e032 confirmed it on
     # independent GPUs, and e033 passed the complete E2B/MoE workload family.
-    # Keep the compile-safe sm100 base above for non-B200 products and stacks.
+    # e063-e066 later selected BKV64 for healthy grids, while a paired 50-repeat
+    # run confirmed that raw_grid=448 regresses. e081-e088 and e084 then selected
+    # stages3 for that BKV64-only region across 8K-256K and packed distributions.
+    # Keep BKV16 as the B200 fallback and the compile-safe sm100 base above for
+    # non-B200 products and stacks.
     add_config(
         registration_id=(
             "triton_gqa_varlen_v1.backward_dkv_b200_tuned.sm100.d512"
@@ -635,6 +684,514 @@ def build_default_registry() -> AttentionKernelRegistry:
             "e030-e033 B200 varlen D512 full F+B: all correctness gates passed; "
             "six-cell family reached 1.956-3.144x same-semantics SDPA, 2026-08-04 PST"
         ),
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_single_qs2.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 4, 3, q_splits=2),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=300,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e116-e125 B200 single-sequence D512 full F+B: qs2 improved "
+            "raw-grid 32-63 by 24-37% with correctness passing; packed and "
+            "sub-2K workloads remain on prior configs, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((32, 64),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_e2b_single_qs8_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=8),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=600,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e173-e178 B200 E2B full D512: NSYS found dKV at 68.2%; "
+            "q8/w8 improved raw-grid 32-105 full F+B by 1.1-37.7% versus "
+            "the prior production ranges, with unchanged allocator peak and "
+            "correctness passing; raw107+ stays on prior configs, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((32, 106),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_bf16_e2b_headgrid_qs2_w4_bf16x2.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 4, 3, q_splits=2),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=905,
+        dtypes=frozenset({"bfloat16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e319-e321/e328-e329 B200 E2B BF16 full D512: raw-grid "
+            "68-105 used "
+            "head-grid q2/w4 with BF16x2 atomics; repeated same-card runs "
+            "improved throughput 0.7-1.7% and reduced allocator peak "
+            "14.1-14.9% versus q3/FP32 scratch; raw64 had a dV max-abs "
+            "failure and remains excluded, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        split_gqa_heads=True,
+        bf16x2_dkv_atomics=True,
+        grid_ranges=((68, 106),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_fp16_e2b_single_qs13_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=13),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=800,
+        dtypes=frozenset({"float16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e222-e227 B200 E2B FP16 full D512: q13 improved raw-grid 32 "
+            "full F+B by 2.3-2.4% versus q11 across paired seeds, with "
+            "unchanged allocator peak and correctness passing; raw33+ stays "
+            "on the prior dtype-agnostic gates, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((32, 33),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_bf16_e2b_headgrid_qs3.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=3),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=900,
+        dtypes=frozenset({"bfloat16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e286-e289 B200 E2B BF16 full D512: mapping GQA heads into the "
+            "dKV grid with q3 improved raw-grid 32-105 by 2.4-4.7% versus "
+            "the production q14/q11/q9/q8 ranges; 100-repeat paired "
+            "correctness and allocator peaks passed, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        split_gqa_heads=True,
+        grid_ranges=((32, 106),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_bf16_e2b_headgrid_qs1_bf16x2.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=1),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=910,
+        dtypes=frozenset({"bfloat16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e291-e302/e314 B200 E2B BF16 full D512: head-grid q1 with "
+            "relaxed BF16x2 atomics improved raw-grid 106-536 while "
+            "matching q1 allocator peaks; versus q4 it also reduced peak "
+            "memory about 14%. The corrected same-shape e314 gate removed "
+            "the raw-grid 281-316 cliff by 34-35%. Scale16384 and 2K-256K "
+            "correctness passed, "
+            "2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        split_gqa_heads=True,
+        bf16x2_dkv_atomics=True,
+        grid_ranges=((106, 537),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_bf16_e2b_single_qs14_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=14),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=850,
+        dtypes=frozenset({"bfloat16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e261-e271 B200 E2B BF16 full D512 after relaxed atomics: q14 "
+            "improved raw-grid 32-34 and 45-76 full F+B by 2.1-5.3% "
+            "versus the prior q11/q8 gates, with 100-repeat paired coverage, "
+            "unchanged allocator peak, and correctness passing; intervening "
+            "and raw77+ ranges stay on prior gates, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((32, 35), (45, 77)),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_e2b_single_qs11_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=11),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=700,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e190-e193 B200 E2B full D512: NCU exposed a 1.73-wave tail; "
+            "q11 improved raw-grid 32-40 full F+B by 3.0-4.3% versus q8 "
+            "with unchanged allocator peak and correctness passing; raw41+ "
+            "is handled by later verified q9/q8 gates, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((32, 41),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_e2b_single_qs9_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=9),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=650,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e200-e201 B200 E2B full D512: q9 improved raw-grid 41-44 "
+            "full F+B by 2.5-3.8% versus q8 with unchanged allocator peak "
+            "and correctness passing; raw45+ stays q8, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((41, 45),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_fp16_moe_single_qs9_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=9),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=600,
+        dtypes=frozenset({"float16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e224-e226 B200 MoE FP16 full D512: q9 improved raw-grid 64-70 "
+            "full F+B by 1.8-2.7% versus q8 across paired seeds, with "
+            "unchanged allocator peak and correctness passing; raw72+ stays "
+            "q8, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({16}),
+        kv_head_counts=frozenset({2}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((64, 72),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_bf16_moe_single_qs14_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=14),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=650,
+        dtypes=frozenset({"bfloat16"}),
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e262-e270 B200 MoE BF16 full D512 after relaxed atomics: q14 "
+            "improved exact raw-grid 64 full F+B by 3.77-3.84% across four "
+            "paired GPUs, with unchanged allocator peak and correctness "
+            "passing; odd/even tail-wave behavior keeps raw65+ on prior "
+            "simple range gates, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({16}),
+        kv_head_counts=frozenset({2}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((64, 65),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_moe_single_qs8_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=8),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=500,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e161-e165 B200 MoE full D512: q8 improved raw-grid 64-94 "
+            "full F+B by 2.32-4.34% with paired confirmations, unchanged "
+            "allocator peak, and correctness passing; raw96+ stays q4, "
+            "2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({16}),
+        kv_head_counts=frozenset({2}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((64, 96),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_moe_single_qs4_w8.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 8, 3, q_splits=4),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=400,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e153-e157 B200 MoE full D512: NSYS found dKV at 47%; w8 improved "
+            "2K-3.5K full F+B by 2.44-5.34% with paired confirmations, "
+            "unchanged allocator peak, and correctness passing, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({16}),
+        kv_head_counts=frozenset({2}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((64, 128),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_single_qs4.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 4, 3, q_splits=4),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=300,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e116-e125 B200 single-sequence D512 full F+B: qs4 improved "
+            "raw-grid 64-223 by 2.7-42% with correctness passing; raw-grid "
+            "224+ and packed workloads remain on prior configs, 2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        min_query_length=2048,
+        separate_dkv_scratch=True,
+        relaxed_dkv_atomics=True,
+        grid_ranges=((64, 224),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.backward_dkv_b200_bkv64_grid.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="backward_dkv",
+        head_dim=512,
+        config=KernelConfig(16, 64, 512, 4, 3, q_splits=1),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=200,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e063-e066 selected BKV64 for verified B200 grids; e081-e088/e084 "
+            "selected stages3 with all correctness gates passing, 2.39-6.35% "
+            "full F+B gain, and unchanged allocator peak; raw_grid=448 stayed "
+            "on BKV16, 2026-08-04 PST"
+        ),
+        grid_ranges=((128, 257), (512, None)),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.forward_b200_e2b_bkv64.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="forward",
+        head_dim=512,
+        config=KernelConfig(32, 64, 512, 4, 2),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=200,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e183-e186 B200 E2B full D512: forward BKV64 improved full F+B "
+            "by 2.0-4.0% at raw-grid 32-240 with unchanged allocator peak "
+            "and correctness passing; longer and packed workloads stay BKV32, "
+            "2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({8}),
+        kv_head_counts=frozenset({1}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        grid_ranges=((32, 241),),
+        grid_probe_block_kv=64,
+    )
+    add_config(
+        registration_id=(
+            "triton_gqa_varlen_v1.forward_b200_moe_bkv64.sm100.d512"
+        ),
+        implementation_id="triton_gqa_varlen_v1",
+        arch="sm100",
+        role="forward",
+        head_dim=512,
+        config=KernelConfig(32, 64, 512, 4, 2),
+        training_modes=frozenset({True}),
+        config_kind="tuned_override",
+        priority=200,
+        gpu_name_patterns=frozenset({"B200"}),
+        evidence_status="verified",
+        evidence=(
+            "e183-e186 B200 MoE full D512: forward BKV64 improved full F+B "
+            "by about 2% at raw-grid 64-96 with unchanged allocator peak and "
+            "correctness passing; raw112+ and packed workloads stay BKV32, "
+            "2026-08-05 PST"
+        ),
+        batch_sizes=frozenset({1}),
+        q_head_counts=frozenset({16}),
+        kv_head_counts=frozenset({2}),
+        window_sizes=frozenset({0}),
+        min_query_length=2048,
+        grid_ranges=((64, 97),),
+        grid_probe_block_kv=64,
     )
 
     for head_dim, config in h100_inference_overrides.items():

@@ -1,0 +1,269 @@
+# Working Notes
+
+- [07-31 22:38 PST] 创建 B200 speedup evidence workspace；审计到 8× B200 空闲、Torch 2.11/CUDA 13、Triton 3.6。确认本轮只做简单 unit correctness、canonical microbenchmark 和必要 profiler，不运行 E2E training。下一步：执行 `e000_baseline_b200`。
+- [07-31 22:38 PST] 用户纠正范围：只优化 varlen/packed implementation，不优化 batched。初版 batched `e000/e001` 在启动前停止；无 benchmark、测试或 kernel 改动。重写 living plan，新 baseline 使用 `e010/e011`。
+- [07-31 22:45 PST] 用户授权连续约 12 小时并要求 profile 主动发现问题；创建 active goal。计划扩展为 compile metadata + registry-aware NCU/NSYS baseline，仍只运行简单 unit correctness 与 microbenchmark，不运行 E2E training。开始 M0。
+- [07-31 22:48 PST] M0 静态检查通过；CPU registry/performance/regression 合约门禁 79 passed。登记 `e005_varlen_tooling_smoke` 后检查 8× B200 均空闲，固定使用 GPU 0。
+- [07-31 22:50 PST] `e005` 通过：B200 varlen FP16/BF16 full/sliding unit gate 8 passed；canonical full D512 与 true-sliding D256 均通过 output/dQ/dK/dV cosine >=0.9999，自动选择 `triton_gqa_varlen_v1` sm100 forward/dQ/dKV 且 0 fallback。工具已具备 immutable raw latency、真实长度 FLOPs/MFU、selection 与 rectangular-grid waste 记录；可启动 baseline。
+- [07-31 22:53 PST] `e010` 单卡串行完成 8/24 cells 后按用户建议中止 launcher（已完成 artifact 保留，GPU 空闲）。登记 `e012` 将余下 16 cells 固定分配至 8× B200，每卡独占并顺序执行 2 cells；这不是失败 retry，kernel/config/workload 均不变。后续 candidate 复用相同 workload→物理 GPU 映射。
+- [07-31 22:56 PST] 用户要求 FLOPS/MFU 以及 SDPA speedup。`e012` 尚未启动即停止；`e010` 的 8 个无 SDPA cells 保留为 diagnostic。工具新增 exact-semantics per-sample PyTorch SDPA：sliding mask 在计时外预建，计时包含逐样本 layout materialization、SDPA 和 packed concat；与 Triton 共用真实长度 semantic FLOPs，分别报告 TFLOPS/MFU 和 speedup。CPU 合约 32 passed，登记 `e013` GPU smoke。
+- [07-31 22:56 PST] `e013` 通过：D512 full 短样本 F+B Triton 0.5735 ms、SDPA 0.9104 ms、1.59x；D256 true-sliding skew Triton 0.5819 ms、SDPA 5.7815 ms、9.94x。两者 correctness/selection 全通过。登记 `e014`：以 profile×phase 固定映射 8 卡，每卡顺序跑三种 packed workload，便于 candidate 同卡对比。
+- [07-31 22:59 PST] `e014` 24/24 passed。D256 sliding：Triton 对 SDPA 4.56–34.84x，MFU 5.46–8.94%；D512 forward：1.23–1.70x，MFU 6.48–7.71%；D512 F+B：仅 0.39–0.70x，MFU 0.64–0.76%，热点明确在 backward。审计发现外部 Ray actors 于 22:56:11 PST 启动并占 GPU 0–3，早于 e014 D512 测量；不终止用户进程，登记 `e016` 在空闲 GPU 4–7 retry D512 12 cells。
+- [08-04 16:45 PST] `e016` clean-GPU retry 完成。D512 forward 为 1.23–1.71× SDPA；D512 F+B 仅 0.36–0.64×，确认性能问题稳定存在，后续只优化 D512 backward。
+- [08-04 16:50 PST] `e020` NSYS 完成：dKV 26.156 ms，占三个 Triton kernel 时间 92.5%；dQ 1.159 ms，forward 0.958 ms。停止在 forward/dQ 上扫参。
+- [08-04 16:58 PST] `e021` NCU 完成：原 BQ64 dKV 使用 166.91 KB shared/block，occupancy 6.25%，eligible cycles 3.45%，local spill requests 52.1M。首个单变量轴确定为 BQ。
+- [08-04 17:02 PST] `e030` BQ probe 完成。BQ16：6.222 ms、3.144× SDPA，数值全通过；BQ64：28.263 ms、0.686×；BQ32：44.369 ms、0.444×；BQ128 shared-memory OOR。只晋级 BQ16。
+- [08-04 17:08 PST] `e031/e032` 两次 50-repeat 确认完成：6.221/6.214 ms，3.096×/3.083×，跨物理卡 median 仅差 0.12%。
+- [08-04 17:14 PST] `e033` 完整 D512 family 候选验证完成：E2B/MoE × balanced/skewed/dominant 6/6 数值通过，1.956–3.144× SDPA，几何平均 2.387×。
+- [08-04 17:34 PST] `e040` 将 BQ16 落入 B200-only production registry override。CPU registry/performance/regression 80/80 通过；B200 varlen FP16/BF16 8/8 通过。测试同时确认未知 sm100 仍使用 BQ64 安全基线。
+- [08-04 17:43 PST] `e041` production public API 验证完成：6/6 选择 `backward_dkv_b200_tuned.sm100.d512`，数值全通过，1.956–3.146×，几何平均 2.389×。
+- [08-04 17:49 PST] `e042` 换卡并提高到 10 warmup/50 repetitions：6/6 数值与 selection 一致，1.927–3.144×，几何平均 2.387×。用户要求的 >1.5× 目标正式完成。
+- [08-04 17:50 PST] 停止继续扫参。当前转入 B200 可运行收口：完整 50-case GPU gate、完整 CPU suite、diff/未跟踪文件审计和顶层文档固化。
+- [08-04 17:52 PST] 已更新顶层 `README/plan/working_notes/results/log_index/commands`，清除过期的“等待 baseline/M0”状态。登记 `e050`，开始完整 B200 可运行门禁。
+- [08-04 17:56 PST] `e050` 完成：完整 CPU suite 88 passed、50 GPU tests skipped；B200 并行 GPU gate 为 batched 16/16、varlen 8/8、image-group 10/10、vision 9/9、semantic 7/7，总计 50/50。kernel-level B200 可运行检查点成立；真实模型 E2E 和代码提交仍待后续。
+- [08-04 17:33 PST] 开始跨 H100/H200/B200 整理。首批只迁移 `attention.py` 内嵌历史 benchmark 到 `benchmarks/history/h100/`，生产 kernel、registry 和三代配置未改；同步修正文档入口。静态编译、历史脚本 import、完整 CPU suite 通过（88 passed、50 skipped）。下一步按硬件归档历史脚本，再处理失败实验 kernel。
+- [08-04 17:37 PST] 用户收紧范围：H100/H200/B200 主要代码、配置和全部正负实验结论必须保留，只删除与三代均无关且无复现价值的内容。已补 12 个 H200 full/sliding × batched/varlen × fwd/dQ/dKV selection 防回退 case；registry 60/60、完整 CPU 100 passed、B200 GPU 50/50 passed。登记 `e051_refactor_no_regression`，按 e042 口径复测 D512 production family。
+- [08-04 17:38 PST] `e051` 完成：D512 production family 6/6 output/dQ/dK/dV 与 selection 通过，1.946–3.095× SDPA，几何平均 2.378×；相对 e042 Triton median 最大绝对变化 0.71%，无回退。后续清理不删除任何三代硬件相关源码、配置或实验结论。
+- [08-04 19:04 PST] 用户要求扩展更长长度并继续优化。登记 `e060_d512_long_matrix_baseline`：E2B/MoE × {4K×4、8K×4、16K×2、32K×1、ragged-16K} 共 10 cells；当前 production config 不变，先建立 correctness/selection/performance baseline，再从最差 cell 做单变量候选。8× B200 全部空闲。
+- [08-04 19:07 PST] `e060` 完成：10/10 correctness/selection 通过，1.59–2.50× SDPA，几何平均约 1.82×；E2B/MoE 的 32K×1 都为 1.59×。用户追加总长度 128K 要求，登记 `e061_d512_128k_probe`：32K×4、64K×2、128K×1、64K 主导 ragged × 两个 profile，共 8 cells；先用 1 warmup/3 repetitions 验证可运行性。
+- [08-04 19:10 PST] `e061` 完成：total-128K 的 8/8 cells correctness/selection 通过，无 OOM/fallback，1.504–1.592× SDPA，几何平均 1.563×。E2B 128K×1 最弱（4932.930 ms vs SDPA 7420.980 ms，1.504×）；登记 `e062` 对该 production cell 采 NSYS。
+- [08-04 19:11 PST] `e062` NSYS：E2B 128K×1 中 dKV 3076.992 ms（62.8%）、dQ 1043.720 ms（21.3%）、forward 782.546 ms（16.0%）。dKV 仍是首要热点但占比低于短序列 92.5%；登记 `e063`，固定 BQ16/warps4/stages2/QS1，只扫 BKV=8/16/32/64，以 full F+B 判断。
+- [08-04 19:15 PST] `e063` 完成：BKV8/16 基本持平（4921.403/4921.832 ms）；BKV32 严重退化到 21186.588 ms；BKV64 降到 3203.026 ms、2.328× SDPA，相对 BKV16 快 34.9%，所有候选 correctness 通过。只晋级 BKV64，登记 `e064` 覆盖 8-cell total-128K family；不直接替换短序列配置。
+- [08-04 19:18 PST] `e064` 完成：BKV64 在 total-128K family 8/8 correctness 通过，2.323–2.470× SDPA，几何平均 2.418×；相对 e061 BKV16 每个 cell 稳定快 34.8–35.3%。登记 `e065` 回测原 6-cell 短矩阵与 e060 10-cell 长矩阵，寻找安全 crossover/gate。
+- [08-04 19:22 PST] `e065` 完成：原短矩阵与长矩阵共 16/16 correctness 通过，2.391–3.848× SDPA。15 个单元相对 BKV16 快 19.6–34.4%；E2B 短不均匀单元跨实验慢 1.2%，尚不足以判定回退。并行波次中 4 个 MoE 命令因权限审批超时未启动，随后仅补跑缺失项并全部通过；这不是 kernel 失败。登记 `e066`，在同一物理卡顺序比较 BKV16/BKV64，并复测 E2B/MoE 128K×1。
+- [08-04 19:30 PST] `e066` 完成：8/8 correctness 通过。E2B 短不均匀 BKV64 比 BKV16 稳定慢 0.86%，MoE 同负载快 22.1%；E2B/MoE 128K×1 分别快 35.1%/35.2%。拒绝无条件全局替换；登记 `e067`，只在已验证的 raw-grid `[128,257)∪[512,+∞)` 启用更高优先级 BKV64，其他范围由现有 BKV16 override 回退。
+- [08-04 19:35 PST] `e067` 完成：新增 B200-only BKV64 grid-gated override，保留 BKV16 fallback。registry 定向 67/67、完整 CPU 107 passed、B200 GPU 50/50。公共 API 24/24 correctness/selection 通过：短序列 2.529–3.847×、长序列 2.389–3.234×、total-128K 2.323–2.475×；E2B 短不均匀按预期回退 BKV16，其余 23 cells 选择 BKV64。H100/H200、batched 与未知 sm100 未修改。
+- [08-04 20:29 PST] 用户要求继续覆盖到 total-256K，并在 128K 与 256K 之间增加测点后继续优化。登记 `e068_d512_160k_256k_scaling`：production public API、BF16 full F+B，E2B/MoE × 160K/192K/224K/256K 单序列，共 8 cells；随后 e069 在 total-256K 覆盖 64K×4、128K×2、256K×1 和 128K 主导不均匀组成。8× B200 当前空闲。
+- [08-04 20:35 PST] `e068` 收尾：7 个完成 cells correctness/selection 通过，2.274–2.354× SDPA。MoE 256K 输出含 2,147,483,648 个元素，正确性工具的单次 `torch.dot` 超过 32 位长度上限；这是 tooling failure，不是 kernel/OOM/数值失败。保留 e068 失败签名，登记 `e069_chunked_metrics_moe256k_retry`，仅将 dot 分块累计后原 workload retry；total-256K packed family 顺延为 e070。
+- [08-04 20:37 PST] `e069` 工具修改完成：超大 tensor dot 按最多 `2^30` 元素分块，定向测试 91 passed，完整 CPU 108 passed、50 GPU skipped。e068 结束后出现外部 8 卡训练，每卡约 19–24 GiB 且利用率 100%；不终止用户进程、不在污染 GPU 上采性能，等待空闲后原样 retry MoE 256K。
+- [08-04 20:40 PST] 用户要求先停止。当前没有本任务 benchmark 进程；外部 8 卡训练未触碰。e069 GPU retry、e070 total-256K packed 矩阵及后续 profile/优化均未启动，保留 e068 的 7 个通过结果、MoE 256K tooling failure 和已通过 CPU 门禁的分块统计修复，等待恢复。
+- [08-04 21:51 PST] 用户恢复任务并要求连续约 10 小时、profile-driven、严格按 skill 格式记录。8× B200 已空闲，无本任务残留进程。living plan 新增 0–10 小时里程碑：先 e069/e070 baseline，再对 256K 单序列/不均匀分布采 NSYS，随后只对首要热点采 NCU；候选按单变量 probe→confirm→repeat，最终回归 2K–256K 多长度与 packed 分布。产品 goal 仍显示 paused，但按用户明确恢复指令继续在 repo 内记录和执行。
+- [08-04 21:55 PST] 用户要求 8 卡全部使用。调整并行调度：GPU 0 继续 e069 MoE 256K retry；GPU 1–6 运行 e070 的 E2B/MoE × 64K×4、128K×2、128K 主导不均匀 6 个新增 cells；GPU 7 登记并运行 e071 E2B 256K×1 production NSYS。256K×1 family 数据分别复用 e068/e069，不重复耗卡。
+- [08-04 21:57 PST] 用户明确目标为同时优化 throughput 与 memory，并保持正确性。统一 canonical benchmark 新增独立显存测量：分别记录 Triton/SDPA 的 baseline、peak 和 incremental peak allocated/reserved；显存测量不进入 latency。正确性仍是 output/dQ/dK/dV 硬门禁。
+- [08-04 21:58 PST] `e071` 完成：E2B 256K×1 的 dKV 5606.015 ms（43.0%）、dQ 4208.199 ms（32.3%）、forward 3209.655 ms（24.6%）。登记 `e072_d512_256k_dkv_ncu`，GPU 7 对最大单项 dKV 采 full 指标；同时 GPU 1–6 已启动 e070 六个 memory-aware packed cells，GPU 0 继续 e069，8 卡均被本任务使用。
+- [08-04 22:00 PST] `e069` retry 完成：MoE 256K×1 output/dQ/dK/dV 与 selection 全通过，25996.464 ms vs SDPA 59865.969 ms（2.30×）；确认 e068 失败只来自统计工具。e070 首批完成 E2B 64K×4（2.40×）与 ragged（2.37×）。GPU 0/1 补跑 E2B/MoE 256K×1 显存口径；登记 `e073_d512_256k_ragged_nsys`，GPU 3 对 E2B ragged 采 NSYS。
+- [08-04 22:02 PST] `e073` 完成：E2B total-256K ragged 的 dKV/dQ/forward 为 1814.976/1371.346/1037.244 ms（43.0%/32.5%/24.6%），与 256K×1 占比基本一致；总 kernel 时间为单序列的 32.4%。登记 `e074_d512_256k_moe_nsys`，并行采 MoE 单序列与 ragged；登记 `e075_d512_memory_scaling_baseline`，补 E2B/MoE 的 2K、32K、128K 显存点，256K 复用 e070。
+- [08-04 22:04 PST] e075 首批 E2B 2K/32K/128K correctness/selection 通过，分别为 1.61×/2.41×/2.31× SDPA。为缩小长度采样间隔，e075 增加 8K；GPU 3–6 补 E2B 8K 与 MoE 2K/32K/128K。期间分支 HEAD 从 `69e325f1` 变为 `4f0abb5c`，两 commit tree 完全相同（`git diff` 为空），不构成代码变量。
+- [08-04 22:06 PST] E2B 256K memory-aware baseline 通过：12967.681 ms、2.28× SDPA。登记 `e076_d512_256k_dq_ncu`，对 e071 中占 32.3% 的 dQ 采 NCU。基于 e021 已确认的低 occupancy/spill，登记 `e080_d512_dkv_warps_probe`：E2B 128K×1 固定 BQ16/BKV64/stages2/QS1，仅比较 warps=2/4/8；同时报告正确性、吞吐和增量峰值显存，e072 完成前不晋级。
+- [08-04 22:08 PST] `e074` 完成：MoE 256K×1 的 dKV/dQ/forward 为 43.4%/32.3%/24.3%，ragged 为 43.0%/32.4%/24.5%。四组 E2B/MoE × single/ragged 的比例一致，优化顺序无需按 profile 或分布分叉。
+- [08-04 22:09 PST] e075 MoE 8K 通过：26.923 ms、2.52× SDPA。登记 `e077_d512_256k_forward_ncu`：NSYS 显示 forward 在四组 256K profile/分布均稳定占约 24.5%，故对 GPU 0 采 full NCU；与 e072 dKV、e076 dQ 组成完整三 kernel 证据。
+- [08-04 22:10 PST] e080 先完成 w4/w8：E2B 128K full F+B 为 3203.325/3231.315 ms，w8 慢 0.87% 且增量 allocated 不变，拒绝 w8；w2 尚在运行。登记 `e081_d512_dkv_stages_probe`：固定 BQ16/BKV64/w4/QS1，比较 stages=1/2/3/4；s2 复用 e080 控制，预测 s1 可能减少 live state/spill，s3/s4 用于验证是否存在流水重叠收益。
+- [08-04 22:11 PST] `e070/e075` 收口：total-256K packed 8/8 正确、2.283–2.439× SDPA，Triton 增量峰值 allocated 为 E2B 4.516 GiB、MoE 9.031 GiB，比 SDPA 少 65.4%–77.5%；2K–256K 单序列 10/10 正确、1.563–2.516×，Triton 显存随 token 数线性，相对 SDPA 少 77.5%–82.8%。
+- [08-04 22:13 PST] `e081` 完成：s1/s2/s3/s4 的 E2B 128K full F+B 为 3429.456/3203.325/3024.998/3038.440 ms；s3 比 s2 快 5.6%，所有 correctness 通过且增量 allocated 同为 2.258 GiB。登记 `e082_d512_dkv_s3_confirm` 在两张物理卡高重复确认；登记 `e083_d512_dkv_s3_family_probe` 扩到 E2B 32K 与 MoE 128K。
+- [08-04 22:15 PST] e083 E2B 32K 完成：s3 194.164 ms，对 production 199.024 ms 快 2.44%，correctness/显存不回退。因接近 2% 晋级门槛，e083 增加 E2B/MoE 8K crossover 点；若短点不稳定，后续只在安全 raw-grid 区间门控。
+- [08-04 22:17 PST] `e083` 完成：s3 在 E2B 8K/32K、MoE 8K/128K 分别比 production 快 3.03%/2.44%/3.96%/5.45%，4/4 correctness 通过且增量 allocated 不变。登记 `e084_d512_dkv_s3_256k_family`，覆盖 E2B/MoE × 256K×1/128K 主导 ragged 四个点；继续使用进程内候选，不修改 registry。
+- [08-04 22:19 PST] `e080` 收口：w2/w4/w8 为 73977.672/3203.325/3231.315 ms；w2 严重退化，w8 慢 0.87%，3/3 correctness 通过且显存相同。保持 warps=4，停止该轴；GPU 3 转跑 e084 E2B 256K ragged。
+- [08-04 22:21 PST] `e082` 双卡高重复确认完成：s3 为 3030.427/3033.389 ms，两卡差 0.10%，相对 s2 控制快 5.40%/5.31%，correctness 与 2.258 GiB 增量显存均通过。登记 `e085_d512_128k_dkv_s3_ncu`，用已确认候选采 NCU 解释收益；GPU 1 补 e084 MoE ragged。
+- [08-04 22:23 PST] e084 E2B total-256K ragged 完成：s3 4016.695 ms，对 production 4227.587 ms 快 4.99%，correctness/显存通过。登记 `e086_d512_dkv_s3_8k_repeat`：E2B 8K 提高到 10 warmup/50 repetitions，并使用曾运行 production baseline 的物理 GPU 3，确认 BKV64 gate 下界收益。
+- [08-04 22:24 PST] `e086` 完成：E2B 8K s3 50-repeat median 18.810 ms，对 production 19.330 ms 快 2.69%，correctness/显存通过。登记 `e087_d512_dkv_s3_moe8k_repeat`：MoE 8K 同样 50-repeat；E2B/MoE 8K 分别覆盖 raw-grid 128/256 两个 gate 边界。
+- [08-04 22:25 PST] `e087` 完成：MoE 8K s3 50-repeat 25.922 ms，对 production 26.923 ms 快 3.72%，correctness/显存通过。登记 `e088_d512_dkv_s3_32k_repeat`，复测 E2B 32K raw-grid 512，补齐当前 BKV64 两段 gate 的下界证据。
+- [08-04 22:26 PST] e084 E2B 256K×1 完成：s3 12178.769 ms，对 production 12967.681 ms 快 6.08%，correctness/显存通过。e084 扩为与 e070 完全相同的 8-cell total-256K family：两个 profile × 64K×4、128K×2、256K×1、ragged；GPU 5 先补 E2B 128K×2。
+- [08-04 22:28 PST] e084 E2B 128K×2 完成：s3 6041.610 ms，对 production 6382.869 ms 快 5.35%。登记 `e089_d512_128k_dkv_s2_ncu`，在 GPU 5 对同一 E2B 128K production s2 dKV 采 full NCU，与 e085 s3 形成配对 profiler 证据。
+- [08-04 22:30 PST] e084 MoE 256K×1 完成：s3 24352.667 ms，对 production 26003.412 ms 快 6.35%，correctness/显存通过。登记 `e090_d512_dkv_s3_160k_224k_scaling`，覆盖 E2B/MoE × 160K/192K/224K；GPU 6 先跑 E2B 192K，验证 128K–256K 中间尺度。
+- [08-04 22:31 PST] `e084` 完成：与 e070 同口径的 8/8 total-256K cells correctness 通过，s3 比 production 快 3.91%–6.35%，增量 allocated 全部不变。登记 `e091_promote_dkv_s3_grid_gate`：只将现有 B200 BKV64 grid-gated override 的 stages 2→3；保留 BKV16 fallback、H100/H200、batched 与未知 sm100。GPU 3 同时补 e090 E2B 224K。
+- [08-04 22:34 PST] e091 代码落地：仅把 `backward_dkv_b200_bkv64_grid.sm100.d512` 的 stages 2→3，并增加 BKV64/BKV16 stages selection 合同。registry/performance/regression 100 passed；完整 CPU 108 passed、50 GPU skipped；compileall 与 diff check 通过。尚未完成 B200 GPU gate 和 production 性能回归，不标记晋级完成。e090 E2B 224K 首次审批超时且未启动，随后用显式 `--device cuda:3` 原 workload retry；GPU 1/6 的 MoE 160K/192K 已正常启动。
+- [08-04 22:36 PST] `e085` NCU 完成：s3 dKV 为 255 regs/thread、198.93 KiB dynamic shared、6.25% occupancy、7.27M spill requests；compute 31.4%、issue 14.5%、no-eligible 85.5%。s3 未提高 occupancy，收益更可能来自流水/依赖隐藏；等待 e089 s2 同长度 control 后再下因果结论。
+- [08-04 22:38 PST] e091 首个 production canonical 启动在进入 kernel 前因 CUDA initialization Error 304 失败；同机获准 probe 正常，保留为环境/权限 diagnostic，并将 GPU gate 顺延为新 ID retry。登记 `e093_d512_dkv_s3_rawgrid448_probe`：复查 e066 曾回退 0.86% 的 E2B 短不均匀 raw-grid 448，判断 stages3 是否改变 BKV64 crossover；不直接扩大 production gate。
+- [08-05 08:46 PST] 中断后审计：8× B200 全空闲，无残留进程；e072/e076/e077/e085/e089 五份 NCU report、e090 六个结果、e093 一个结果均完整落盘。e090 的 E2B/MoE × 160K/192K/224K 6/6 正确，s3 比 e068 s2 快 5.62%–6.01%，增量显存线性。e093 raw-grid 448 的 BKV64/s3 为 8.017 ms，较 e066 BKV16 8.216 ms 表面快 2.42%，先登记 e094 同卡配对，不直接扩大 gate。
+- [08-05 08:48 PST] NCU 差分完成：128K dKV s2→s3 duration 2.20→1.962 s（-10.8%），compute/issue 提升，但 dynamic shared +19.8%、spill +52.1%，occupancy 不变；保留该吞吐/局部访存权衡。dQ 为 200.70 KiB shared、82.05% no-eligible、0 spill，首轴选 stages；forward 为 255 regs/thread、9.67B spill，首轴选 warps。候选工具新增进程内 `--role`，CPU 定向 100 passed、compileall/diff check 通过；登记 e100/e101。
+- [08-05 09:53 PST] 8 卡并行完成 e094/e100/e101：raw-grid 448 同卡 BKV16/s2 8.2219 ms、BKV64/s3 8.0293 ms（+2.34%），正确且显存相同，暂不扩大 gate。dQ s2 比 s1 快 11.5%，s3/s4 因 324/452 KiB shared OOR；forward w4 比 w2/w8 快，均无新 winner。
+- [08-05 09:58 PST] e102–e105 负结果归档：dQ 缩小 BQ/BKV 慢 15.1%–25.1%；forward stage/tile 候选慢 1.2%–10.9% 或 OOR；dKV q_splits=2 速度近似持平却多约 0.50 GiB，qs4–32 更慢。正确性优先，全部不晋级；production 只保留 B200 BKV64/s3。
+- [08-05 10:04 PST] e106/e107 production registry 回归完成主要 cells：GPU 数值门禁 8/8；E2B 单序列 2K–256K 为 1.65–2.51×，MoE 为 1.55–2.61×；E2B/MoE 256K 分别 2.39×/2.48×，峰值 4.516/9.031 GiB，对 SDPA 20.066/40.082 GiB。160/192/224K、256K ragged 全正确且显存线性。
+- [08-05 10:04 PST] e108 固定总长 256K 显示明显分布敏感性：E2B 2K×128、4K×64、8K×32、16K×16、32K×8、64K×4 为 8.38/4.67/3.33/2.78/2.57/2.50×；MoE 已完成点为 6.52/3.89/2.97/2.67×。同 profile 的 Triton 峰值不随组成变化；后续报告必须同时给总长与长度分布。
+- [08-05 10:08 PST] e108 收尾：E2B 128K×2/256K×1 为 2.46×/2.39×，MoE 32K×8/64K×4/128K×2/256K×1 为 2.58×/2.55×/2.53×/2.48×；固定总长 256K 的双 profile 分布矩阵全部正确。
+- [08-05 10:09 PST] e109 release gate：完整 CPU 108 passed、50 skipped；B200 batched/varlen/image-group/vision/semantic 共 50/50，GPU5/6/7 各追加 varlen 8/8。compileall、staged/unstaged diff check、registry/performance 91/91 通过。
+- [08-05 10:15 PST] e110–e113 源码级 reload-V 实验：依据 dKV 高 spill/高 L2 hit，尝试缩短 V tile live range。stage3 shared 增至 264,464 bytes 而 OOR；stage2 正确但 E2B 8K 20.775 ms，比同卡 control 18.781 ms 慢 10.6%。已完整撤回，revert smoke 18.805 ms，`attention.py` 零 diff。
+- [08-05 10:18 PST] e114 reload-Q 实验：E2B 8K 18.8048 ms，与 control 18.8049 ms 持平；NCU 仍为 255 regs、198.93 KiB shared、6.25% occupancy，说明编译结果等价。按 no-impact 撤回，`attention.py` 继续零 diff。
+- [08-05 10:20 PST] e115 BKV32 短边界失败：raw-grid=128 虽翻倍 blocks，但最佳 s1 仍慢约 25%–29%，s2–s4 严重退化。改为保持 BKV64/s3，仅扫 q_splits。
+- [08-05 10:23 PST] e116–e119 发现短单序列 qsplit winner：raw64/96/192 的 qs4 分别快约 32%–42%、7%–12%；raw16/32/48 快约 36%–48%。raw256 的 MoE 持平，因此不上界。
+- [08-05 10:27 PST] e120–e124 packed 消歧：固定 qs4 在 1K×8/512×8 回退，target256/qs2 仍有 2%–18% 回退；BKV64/qs1 在短端也可慢 1%–18%。production 候选收紧为 batch=1、query≥2K；packed/sub-2K 保留旧路径。
+- [08-05 10:30 PST] e125 上边界：raw208 快 4.7%–9.4%，raw224 快 2.7%–7.1%，raw240/248 的 MoE 仅 1.2%/0.5%，且 qs>1 相对显存约高 22%。保守上界取 `<224`。
+- [08-05 10:33 PST] e126 production 晋级：B200-only 新增 batch=1/query≥2K override，raw32–63=qs2、raw64–223=qs4。E2B 2K/4K/8K 为 2.22/2.88/2.84× SDPA；MoE 2K/4K/6K 为 2.65/2.60/2.56×。raw224 正确回退。
+- [08-05 10:35 PST] e127 最终门禁：packed 三点选择旧 q1 且 latency 与 control 一致；完整 CPU 118 passed、50 skipped，B200 GPU 50/50，compileall、staged/unstaged diff check 通过。
+- [08-05 10:39 PST] e128 q4 NCU：8K dKV grid 128→512、waves/SM 0.86→3.46，duration 17.97→9.22 ms；regs/shared/occupancy 不变。收益来自补足并行度，不是单 block 资源下降。
+- [08-05 10:41 PST] 8 卡 e129：q4 下并行扫描 warps/stages/BQ/BKV，全部 correctness/显存通过；BQ8 只快 0.15%，其余慢 0.85%–严重退化，不晋级。
+- [08-05 10:42 PST] e130 NSYS：qsplit 后 E2B8K 的 dKV/dQ/forward 为 5.524/4.240/3.575 ms（41.4%/31.8%/26.8%），热点已均衡。
+- [08-05 10:44 PST] e131 NCU：dQ 为 181 regs、200.70 KiB shared、0 spill、81.04% no-eligible；forward 为 255 regs、100.35 KiB shared、9.52M spill。按证据只试 forward causal 两段循环。
+- [08-05 10:45 PST] e132 源码 probe：D512 forward 两段循环在 E2B8K/MoE4K 慢 0.16%/0.18%；数值/显存通过但无收益，已撤回，`attention.py` 零 diff。
+- [08-05 10:47 PST] e133 8 卡非 2 次幂 qsplit：q3/q5/q6/q7 全正确且显存相同，但均未超过 q4；尾波对齐不足以抵消额外工作。
+- [08-05 10:49 PST] e134 8 卡 memory probe：独立 FP32 dK/dV scratch + 顺序释放使 E2B8K/MoE4K 峰值精确下降 8 MiB（-4.53%），吞吐变化在噪声内。
+- [08-05 10:51 PST] e135 production 晋级：registration 新增 `separate_dkv_scratch`，仅 B200 D512 qs2/qs4 为 true；8 个真实 registry 点正确且显存线性下降。
+- [08-05 10:52 PST] e136 release gate：CPU118、B200 GPU50/50；packed 三点保持旧 q1，延迟/峰值与 e127 一致；H100/H200/未知 sm100 allocation policy 为 false。
+- [08-05 10:54 PST] e137 50-repeat：E2B8K 13.449 ms、MoE4K 7.698 ms，均 0.165 GiB；延迟相对 e126 +0.08%/+0.22%，显存 -4.53%。
+- [08-05 10:56 PST] e138 提前释放 delta：E2B8K/MoE4K 峰值再降 0.25 MiB 到 176,422,912 bytes，latency/selection 不变。
+- [08-05 10:57 PST] e139/e140 forward hoist-Q：latency 仅噪声变化；NCU 仍为 6.08 ms、255 regs、100.35 KiB shared、12.13% occupancy，确认编译等价并撤回。
+- [08-05 10:59 PST] e141 最终确认：E2B8K/MoE4K 50-repeat 13.442/7.692 ms，峰值较原 qsplit -4.67%；packed q1 4.861 ms。CPU118、varlen GPU8/8、compile/diff 通过。
+- [08-05 11:02 PST] e142 split-delta：三个点全正确但 full F+B 无收益。e143 首份 NSYS trace 无 CUDA kernel data，保留失败签名并登记 e144 retry。
+- [08-05 11:03 PST] e144 NSYS：独立 delta 让 dQ 只快 11.8 µs，却新增 41.1 µs kernel，净慢约 29 µs；恢复 `STORE_DELTA=True`。
+- [08-05 11:05 PST] e145 dQ warps：E2B8K w4/w8/w16 为 13.540/13.454/16.082 ms，MoE4K w16 慢 17.8%；保持 w8。
+- [08-05 11:08 PST] e146 最终审计：HEAD diff 11 文件仅修改，无删除/重命名；CPU119。8 卡同时完成 GPU50/50，GPU5/6/7 各追加 varlen8/8；H100/H200/未知 sm100 合同通过。
+- [08-05 11:10 PST] e147 E2E 环境审计：无本地 Gemma-4-E2B gated 权重和 `/opt/tiger/flash_gemma`；系统 transformers/huggingface_hub 导入冲突。未启动下载或伪造模型结果。
+- [08-05 11:12 PST] e148 FP16：E2B8K/MoE4K 50-repeat 为 13.451/7.690 ms，2.37×/2.17× SDPA，峰值同为 176,422,912 bytes；两个注册 dtype 均通过。
+- [08-05 11:13 PST] e149 qs2 FP16：E2B2K 2.201 ms、0.041 GiB、约 1.50× FP16 SDPA；正确。Triton 与 BF16 latency 相同，倍数差来自更快的 FP16 SDPA。
+- [08-05 11:15 PST] e150 8 卡 dKV warp-specialize：E2B 2K–256K、MoE4K、packed64K×4 均因 D512 shared 266,640 > 232,448 bytes 失败；GPU 门禁 2/8，通过外的 D256 还出现 OOR/`NVWSInsertAref` 编译错误。该单变量已完整撤回，登记为 shared-heavy dKV 的禁区。
+- [08-05 11:18 PST] e151 8 卡回退门禁：GPU8/8；E2B 2K/8K/32K/128K/256K 为 2.19/2.84/2.47/2.45/2.38×，MoE4K 2.60×，packed64K×4 2.49×。显存/selection 均恢复 production，e150 无残留回退。
+- [08-05 11:22 PST] e152 dKV GQA loop：针对 255 regs/spill 将静态展开改普通 constexpr loop。GPU8/8、显存不变，但 E2B 2K/8K/32K/128K 慢 6.4%/3.5%/1.3%/0.8%，MoE4K 慢 8.5%，packed 慢 4.0%；已恢复 `tl.static_range`。
+- [08-05 11:27 PST] e153 MoE4K NSYS：dKV/dQ/forward 平均 3.607/2.208/1.852 ms，占主 kernel 47.0%/28.8%/24.2%；相对 E2B8K 更偏 dKV。8 卡同步门禁 GPU8/8，2K–128K/packed 吞吐、显存和 selection 稳定；下一步单独扫 GQA=2 dKV 资源配置。
+- [08-05 11:28 PST] e154 MoE4K dKV 8 卡资源扫参：w8 唯一候选，7.567 ms 比 w4 7.698 ms 快 1.71%，显存不变；s2 慢，BKV32 慢约 7×，BQ32 OOR。
+- [08-05 11:29 PST] e155 同卡配对：8 卡 w4→w8 全部提升 1.49%–1.62%，均值 7.6870→7.5683 ms（+1.54%），正确性/显存不变。因低于默认 2% 门槛，先扩展 MoE2K–约7K 长度族，不直接晋级。
+- [08-05 11:31 PST] e156 MoE w8 长度族：2K/2.5K/3K/3.5K 快 5.34%/3.34%/2.44%/2.73%，4K/5K/6K 仅 1.77%/1.02%/0.70%，7040 慢 0.12%；显存逐点一致。候选收紧为 Q16/KV2、raw-grid 64–127，raw128+ 保持 w4。
+- [08-05 11:33 PST] e157 4+4 卡边界复核：MoE2K 四卡快 4.88%–5.16%，3.5K 四卡快 2.53%–2.70%；正确性/显存逐卡一致，允许隔离晋级。
+- [08-05 11:36 PST] e158 production 晋级：仅 B200 D512 full Q16/KV2、batch1、raw64–127 选 w8。MoE2K–3.5K 为 2.392–5.991 ms、2.67–2.81× SDPA；4K/E2B/packed 保持 w4/q1。CPU定向114、GPU8/8 通过。
+- [08-05 11:40 PST] e159 release gate：CPU123、compileall/diff check 通过；8 卡同时完成 GPU0 全套173（GPU专项50/50）与 GPU1–7 各 varlen8/8。HEAD diff 11 文件仅修改，无删除/重命名；H100/H200/未知sm100、E2B/packed/sliding/4K+ 合同通过。
+- [08-05 11:42 PST] e160 MoE2K w8 NSYS：dKV/dQ/forward 平均 1.205/0.630/0.530 ms，占主 kernel 51.0%/26.6%/22.4%，dKV 仍为首要热点。FP16 2K/3.5K 为 2.15×/2.20× SDPA且显存同BF16；4K/E2B/packed/GPU8/8 回退通过。
+- [08-05 11:44 PST] e161 MoE2K w8 dKV NCU：255 regs、198.93KiB shared、12.5% occupancy、1.73 waves/SM、84.17% no-eligible；w8 收益来自单block active warps翻倍，但仍每SM仅1 block。
+- [08-05 11:45 PST] e162 局部资源扫参：BQ8只快0.22%；s2慢1.6%，w4慢约5%，w16慢约3.7×；显存/正确性一致，无晋级。只剩 NCU 支持的 q-split/wave 轴。
+- [08-05 11:46 PST] e163 q-split：MoE2K q1/q2/q4/q8 为4.068/2.695/2.386/2.283ms，q8快4.34%；3.5K q8仅快1.23%。qs>1显存完全相同、正确性通过；登记细粒度 crossover。
+- [08-05 11:48 PST] e164 两卡/长度 crossover：q8 在2K快4.29%–4.31%、2.5K快3.27%–3.50%；3K仅1.73%–1.79%、3.5K仅1.15%–1.25%。显存/正确性一致；上界缩到raw80–96，继续测raw88/94。
+- [08-05 11:50 PST] e165 上边界：raw88四卡q8快2.56%–2.64%，raw94四卡快2.32%–2.44%；显存/正确性一致。结合raw96低于2%，最终q8 gate取[64,96)，raw96–127保持q4。
+- [08-05 11:52 PST] e166 q8/w8 production：MoE2K/2.5K/2816/3008为2.290/3.318/3.894/4.355ms、2.77×–2.94×SDPA；raw96回w8/q4，raw128回w4/q4。CPU定向117、GPU8/8，显存/正确性全通过。
+- [08-05 11:53 PST] e167 大split：MoE2K q4/q8/q16/q32=2.394/2.282/2.403/2.773ms，2.5K=3.437/3.304/3.488/3.944ms；q8最优，q16/q32回退且显存相同。停止dKV资源轴。
+- [08-05 11:55 PST] e168 q8后NSYS：dKV/dQ/fwd=1.106/0.629/0.534ms，占48.4%/27.5%/23.4%；dKV较q4约-8.2%。FP16 q8为2.24×–2.29×，raw96/128/packed/GPU8/8通过；转向dQ。
+- [08-05 11:57 PST] e169/e170 dQ：NCU为181regs、200.70KiB shared、0spill、12.5% occupancy、80.59% no-eligible；w4/w16、BQ16、BKV32、s1及组合均慢，显存/正确性一致。保持BQ32/BKV64/w8/s2，停止dQ轴。
+- [08-05 11:59 PST] e171/e172 forward：NCU为255regs、100.35KiB shared、1.22M spill、11.85% occupancy、72.11% no-eligible；w2/w8、BQ16、BKV16、s1、BQ16/BKV64均慢。保持BQ32/BKV32/w4/s2，转向E2B2K低grid。
+- [08-05 12:04 PST] e173/e174：E2B2K q2 的 NSYS 显示 dKV 占68.2%；低grid扫描中 q4/w8 将 full F+B 2.191→1.469ms（+32.98%），显存/正确性一致。
+- [08-05 12:09 PST] e175–e178 8卡长度与边界确认：q8/w8 在raw32–105稳定获益，raw107后低于1%、raw112无收益；保守gate取[32,106)。
+- [08-05 12:12 PST] e179 production：仅B200 full D512 Q8/KV1 batch1启用q8/w8。2K为1.367ms、3.50×SDPA、0.041GiB；2K–6720为2.81×–3.50×，6848/8K/packed正确回退。CPU120、GPU8/8。
+- [08-05 12:15 PST] e180 post-profile：dKV/dQ/fwd=49.3%/26.5%/23.5%，dKV 1.494→0.667ms；FP16、sliding、MoE、packed和两卡GPU数值门禁通过。
+- [08-05 12:18 PST] e181/e182：q16仅2K噪声级收益且4K回退，q32慢；dQ全部资源候选慢或OOR，均不晋级。
+- [08-05 12:21 PST] e183/e184：forward BKV64是唯一winner；E2B2K快3.26%，2K–12K八点均快2.3%–4.0%，正确性/显存一致。e185正在覆盖MoE、packed、32K、128K。
+- [08-05 12:28 PST] e185/e186：BKV64在128K回退约1.2%，不做全局override；crossover确定E2B raw32–240、MoE raw64–96为安全gate，packed/长序列保持BKV32。
+- [08-05 12:32 PST] e187 production：E2B2K 1.325ms、3.61×SDPA，MoE2K 2.242ms、3.00×；8卡覆盖上下界、回退边界与packed，8/8正确，CPU定向129。
+- [08-05 12:38 PST] e188–e190：forward后dKV/dQ/fwd=50.9%/27.4%/21.0%；2K–256K/FP16/packed正确。q8 dKV NCU为255regs、198.93KiB、12.5% occupancy、1.73 waves，尾波成为新证据。
+- [08-05 12:43 PST] e191–e193：非2次幂q11在raw32–40稳定快2.96%–4.25%，raw41降到1.63%；显存/正确性一致，gate取[32,41)。
+- [08-05 12:46 PST] e194 production：2K四卡1.264–1.268ms、3.75×–3.79×SDPA、0.041GiB；2.5K两卡一致，raw41/packed回退，CPU131、GPU8/8。
+- [08-05 12:50 PST] e195 q11 后 NSYS：dKV/dQ/forward=48.8%/28.6%/21.9%；FP16、边界、MoE、8K、packed 正确。
+- [08-05 12:54 PST] e196/e197 BKV64 forward：NCU 显示 255regs、167.94KiB shared、6.25% occupancy、78.6% no-eligible；8 卡资源扫描无超过门槛的 winner，保持原配置。
+- [08-05 12:57 PST] e198/e199：MoE q9 只快1.56%；D512 forward 两段循环无收益并已撤回。两项负结论保留。
+- [08-05 13:04 PST] e200/e201 E2B q9：raw41–44 稳定快2.49%–3.78%，raw45起低于门槛；显存/正确性一致，gate取`[41,45)`。
+- [08-05 13:09 PST] e202 production：raw41/44 双卡为1.862/2.060ms，3.49×–3.68×SDPA；raw45、2K、4K、packed正确回退。CPU133、GPU8/8。当前E2B分段为raw32–40 q11、41–44 q9、45–105 q8。
+- [08-05 13:17 PST] e203 q9后NSYS：raw44的dKV/dQ/forward=46.4%/30.0%/23.2%。8卡并行FP16/sliding/MoE/packed/8K/128K/256K均正确；128K/256K为2.44×/2.42×SDPA、2.258/4.516GiB。
+- [08-05 13:23 PST] e204 q10尾波probe：首次命令因多余`--phase`在argparse退出，未跑kernel；正确重试后raw45略慢，raw46–48仅快0.3%–0.9%，显存一致。不晋级，保持q9/q8边界。
+- [08-05 13:27 PST] e205 release门禁：CPU142、B200主门禁50/50、另三卡varlen各8/8；compileall/diff check通过，11文件仅修改，无删除/重命名。
+- [08-05 13:30 PST] 登记e206显存源码probe：只将B200 qsplit独立dK/dV scratch由FP32改FP16，目标是scratch减半且atomic流量不增；8卡覆盖q11/q9/q8/q4、E2B/MoE、BF16/FP16/packed，数值或吞吐回退即撤回。
+- [08-05 13:34 PST] e206常规数据8/8正确：全dtype FP16 scratch使full F+B快约1%–5%、峰值约-9.5%。因改变BF16累加范围，暂不晋级。
+- [08-05 13:37 PST] e207同卡100-repeat：E2B2K/raw44/E2B8K/MoE2K快4.0%/3.0%/1.1%/4.7%–4.8%，显存-9.5%；性能成立但仍需动态范围门禁。
+- [08-05 13:40 PST] e208多seed与qsplit边界8/8通过；新增`--grad-output-scale`做BF16大梯度压力。e209初轮发现固定绝对容差误报，修正为按尺度线性调整并记录两侧非有限数。
+- [08-05 13:44 PST] e210确认全dtype方案错误：scale8192候选dV有41个非有限、reference为0；scale16384候选dK/dV为73/450、reference均0。拒绝BF16使用FP16 scratch。
+- [08-05 13:47 PST] e211收紧为dtype gate：仅FP16输入用FP16 scratch，BF16保留FP32。BF16 scale8192/16384恢复全有限并通过；FP16四点8卡正确。
+- [08-05 13:51 PST] e212最终同卡100-repeat：FP16 E2B2K/raw44/E2B8K/MoE2K分别快约5.1%/3.8%/1.3%/5.7%，峰值显存均约-14%；双卡重复、数值通过，允许晋级。
+- [08-05 14:01 PST] e213 release门禁：CPU142；B200 GPU50/50 + varlen8/8；BF16 scale8192/16384全有限正确；compileall/diff check通过。11文件仅修改，无三代资产删除或重命名。
+- [08-05 14:05 PST] e214 BF16顺序split单scratch：8卡数值通过、峰值约降4%–5%，但E2B2K/raw44/8K/MoE2K慢约7%–18%；重算scores/P不划算，源码完整撤回。
+- [08-05 14:07 PST] e215撤回门禁：8卡四点双卡延迟恢复1.268/2.059/13.05–13.08/2.237–2.240ms，显存与数值恢复；`attention.py`无e214或split-qsplit残留。
+- [08-05 14:11 PST] e216原生BF16 atomic micro：首次因pointer/BF16广播类型检查失败、未跑kernel；指针转uint64后8卡成功。1M元素×11 splits为约0.050ms，对FP32约0.048ms，数值全有限。
+- [08-05 14:15 PST] e217接入真实dKV：BF16大梯度/常规数值通过、显存约-14%，但2K/raw44/8K/MoE2K慢约20%–75%；高争用标量atomic不可用，立即撤回。
+- [08-05 14:17 PST] e218撤回门禁：8卡四点双卡恢复1.268/2.059/13.05–13.08/2.237–2.241ms；源码无inline BF16 atomic残留，FP16 dtype gate保留。
+- [08-05 14:19 PST] e216扩展BF16x2：8卡正确且全有限，约0.044–0.046ms，比FP32 atomic快4%–8%，进入真实dKV probe。
+- [08-05 14:22 PST] e219 BF16x2真实dKV：显存约-14%、大梯度/常规数值通过，但E2B2K/raw44/8K/MoE2K慢6.7%/4.8%/0.8%/7.4%；不以吞吐换显存，撤回。
+- [08-05 14:24 PST] e220撤回门禁：8卡四点双卡恢复稳定延迟与显存；源码无BF16x2/e219残留。
+- [08-05 14:37 PST] e221 FP16长度矩阵完成：E2B 2K–256K为2.23×–2.75×SDPA，MoE为2.26×–2.43×；4×2K为2.76×/2.59×，ragged128K为2.32×/2.41×。全数值正确，长端峰值线性，短端dtype gate与长端q1均无回退。
+- [08-05 14:40 PST] e222 候选工具新增 `--separate-dkv-scratch`。首次字段层级错误在启动 kernel 前退出；修正后 8 卡扫 q8–q16，E2B FP16 2K 的 q13 为1.1722ms，比 q11 快2.25%，显存相同。
+- [08-05 14:43 PST] e223 E2B q13 同卡边界：raw32 双 seed 稳定快约2.4%；raw34仅1.3%，raw36/38持平，raw40慢2.7%，raw41/44无收益。候选缩到raw32。
+- [08-05 14:46 PST] e224/e225 MoE FP16 qsplit：q9在raw64/66/68快约2.1%/1.8%/2.7%，raw72已持平；所有数值与显存门禁通过。
+- [08-05 14:49 PST] e226 复核：MoE q9在raw66/68/70重复快1.8%/2.7%/2.4%；E2B q13 raw32两个新seed均快约2.4%。
+- [08-05 14:52 PST] e227 精确边界：E2B q13在raw33/34/35仅快约1.8%/1.3%/1.0%，最终只晋级raw32。
+- [08-05 14:55 PST] e228 production：新增FP16-only E2B raw32 q13、MoE raw64–71 q9。8卡命中点、边界、BF16与packed全正确；E2B/MoE FP16 2K为1.1757/2.0667ms、2.82×/2.48×SDPA，峰值0.035/0.071GiB。CPU定向138、compile/diff通过。
+- [08-05 15:02 PST] e229 FP16 post-profile：E2B dKV/dQ/fwd=528.5/357.1/274.1us，MoE=943.8/626.3/479.4us；dKV仍约占45%。FP16 E2B128K 2.30×、MoE256K 2.37×，边界、packed与BF16大梯度正确。
+- [08-05 15:07 PST] e230–e232 NCU/资源：dKV与dQ均约233.47KiB shared、12.5% occupancy，forward 255regs、6.25% occupancy且有spill；warps/stages/tile候选全部无收益，显存不变。
+- [08-05 15:11 PST] e233 源码probe：dKV先计算split范围，空尾split直接退出，不再加载K/V或发零atomic。常规回归正确，E2B/MoE 2K初测约快1.0%/1.1%，显存不变。
+- [08-05 15:16 PST] e234 八卡同卡100-repeat：E2B四卡均快0.96%–1.03%，MoE四卡均快1.08%–1.11%；8/8数值正确、峰值显存完全相同，保留该源码简化。
+- [08-05 15:20 PST] e235 release gate：CPU147、GPU50/50，另四卡varlen各8/8；MoE dKV内核快2.23%。首份E2B NSYS无CUDA数据，失败签名保留并由e236重试。
+- [08-05 15:24 PST] e236 E2B NSYS重试：dKV 528.5→517.5us（-2.10%），dQ/fwd不变。BF16 raw40/41/45、FP16 MoE raw70/72、8K与ragged回归全正确；ragged 1.81×SDPA、0.132GiB。
+- [08-05 15:28 PST] e237/e238 提前退出后FP16 split复扫：E2B q13为1.1595ms，MoE q9为2.0442ms，仍各自最优；所有候选正确且峰值相同，production不变。
+- [08-05 15:32 PST] e239/e240 BF16 split复扫：E2B q12比q11仅快约0.7%；MoE q9比q8快约1.9%，与旧实验约1.6%一致。均低于稳定晋级门槛，显存/正确性一致，停止split轴。
+- [08-05 15:38 PST] e241/e242 dKV冗余ds mask源码probe：8卡同卡同seed A/B仅快0.10%–0.29%，显存相同、数值正确。低于门槛且显式mask更稳健，源码已恢复，无候选残留。
+- [08-05 15:43 PST] e243 full-causal dense分支：跳过远离对角线的逐元素比较后，FP16慢0.0%–0.2%，BF16仅快0.08%–0.15%；8卡数值/显存通过但无通用收益，源码已撤回。
+- [08-05 15:49 PST] e244 Q/GQA循环交换：8卡均在kernel前shared OOR，需要659,472>232,448 bytes。e245降低资源后，仅BKV32/w8/s1可运行但1.702ms，比control慢约46%；其余OOR或更慢。源码已撤回。
+- [08-05 15:53 PST] e246 `disallow_acc_multi_buffer`：8卡四种dtype/profile与e242同卡control差异≤0.06%，显存/数值相同；编译器原本未额外多缓冲，属性已撤回。
+- [08-05 16:01 PST] e247 causal稠密分支长端：32K/128K×FP16/BF16×E2B/MoE全正确、显存相同，但FP16稳定慢0.81%–1.03%，BF16也约慢1%；源码再次撤回，长短端均停止。
+- [08-05 16:06 PST] e248 dKV scale常量化：8卡与e242 control多数差异≤0.02%、最大约0.07%，显存/数值相同；Triton已有效折叠，签名恢复普通参数。
+- [08-05 16:12 PST] e249 FP16 tail-wave后dKV资源：BQ8/w8/s3在E2B/MoE分别1.1636/2.0464ms，略慢于BQ16 control 1.1605/2.0440ms；s2/w4更慢，显存/数值一致，无晋级。
+- [08-05 16:17 PST] e250 FP16 MoE dQ资源：control 2.0480ms；w4/w16/BQ16/BKV32/s1/组合均慢1%–25%，s3 shared OOR；可运行点数值/显存通过，原配置最优。
+- [08-05 16:22 PST] e251 FP16 MoE forward资源：w8为2.0379ms、control w4为2.0480ms，仅快约0.5%；其余候选慢或OOR。显存/正确性一致，低于full F+B晋级门槛。
+- [08-05 16:26 PST] e252 PTX审计：FP16 atomic已是v8.f16，BF16/FP32 scratch已是v4.f32，排除手写half2；两者默认acq_rel，下一步只测试relaxed内存序。
+- [08-05 16:31 PST] e253/e254 relaxed vs acq_rel同卡100-repeat：FP16 E2B/MoE均快约4%，BF16快约8.1%/7.4%；8卡数值正确、峰值逐字节相同，winner成立。
+- [08-05 16:36 PST] e255 production：新增registry字段与kernel constexpr，仅B200已验证qsplit配置开启。8卡覆盖四个2K点、raw41/raw96、8K和packed；全部正确，packed q1 telemetry为false。FP16 2K 1.117/1.962ms，BF16 1.166/2.068ms。
+- [08-05 16:40 PST] e256 压力：BF16 E2B/MoE scale8192/16384全正确且全有限；额外seed的FP16 E2B2K 1.1135ms、MoE raw70 2.2734ms，BF16 raw44/8K稳定。8卡峰值不变。
+- [08-05 16:45 PST] e257 post-profile：E2B dKV/dQ/fwd=471.3/356.7/273.7us，MoE=842.6/625.2/478.0us；dKV较relaxed前快约8.9%/8.7%，热点占比降至42.6%/43.1%。NCU与PTX确认relaxed生效；四卡profile、四卡数值门禁共8卡并行，全部通过。
+- [08-05 16:49 PST] e258 release gate：CPU147；GPU0全套197，GPU1–7各varlen8/8；定向138、compileall、两侧diff check通过，11文件仅修改。首轮sandbox因设备节点不可见在kernel前Error304，宿主权限域重试全过，失败签名保留。
+- [08-05 16:55 PST] e259–e262 relaxed后split复扫：FP16 E2B/MoE新点最多仅快0.8%/1.3%，不晋级；BF16 E2B/MoE q14初测快2.8%/3.8%，显存逐字节相同、全部正确。
+- [08-05 17:00 PST] e263 BF16 q14同卡100-repeat：E2B四卡稳定快2.49%–2.62%，MoE四卡快3.77%–3.84%；8/8正确且峰值相同。winner成立，进入raw-grid边界确认。
+- [08-05 17:08 PST] e264/e265 BF16 E2B q14边界：raw32–34快约2.5%，raw35–44多数低于门槛；raw45–52重新达到3.7%–5.3%。全部正确且峰值相同，证实尾波分段，禁止粗粒度覆盖。
+- [08-05 17:14 PST] e266 BF16 E2B q14长度族：raw54–72快2.4%–3.5%，raw80/96/105降至1.9%/1.5%/1.0%。候选暂定raw45–72，继续测上边界和MoE泛化。
+- [08-05 17:20 PST] e267 BF16 MoE q14长度族：raw64/66/68快3.4%–3.8%，raw70仅1.5%；raw72/80约2.1%，raw88/95降至1.6%/0.8%。全部正确、峰值相同；收益非单调，补奇数raw后保守分段。
+- [08-05 17:27 PST] e268/e269 BF16 E2B q14上边界与补点：raw45–76已测点均快2.1%–5.3%，raw77起低于2%；全部正确且峰值相同，补最后空点后可形成连续gate。
+- [08-05 17:32 PST] e270 BF16 MoE q14消歧：同一向偶数取整的raw-grid内，不同tile尾长度收益可从0.5%变到3.5%，现有registry无法安全隔离。只考虑`min_length=2048 + raw64`，它精确命中2K且已四卡确认。
+- [08-05 17:38 PST] e271 BF16 E2B q14最后空点8/8均快2.2%–3.8%；合并全部100-repeat证据，安全gate确定为raw32–34、45–76，raw35–44与77+不变。
+- [08-05 17:43 PST] e272 production：新增两个B200/BF16-only q14注册项。8卡命中/边界全正确；E2B关键点3.23×–4.20×SDPA，MoE2K 3.38×，峰值不变。CPU定向143、compile/diff通过。
+- [08-05 17:48 PST] e273 release gate：CPU152；GPU0全套202、GPU1–3各8/8；其余四卡完成E2B/MoE × scale8192/16384，全部正确。压力下E2B 4.18×–4.22×、MoE 3.33×–3.38×，峰值0.041/0.082GiB不变。
+- [08-05 18:03 PST] e274 当前BF16长度矩阵：E2B 2K/8K/128K/256K为4.20×/2.93×/2.45×/2.42×，MoE为3.38×/2.61×/2.49×/2.46×；8/8正确。256K峰值4.516/9.031GiB，约为SDPA的22.5%，长端selection正确回退。
+- [08-05 18:08 PST] e275 q14后profile：E2B/MoE dKV仍占42.9%/43.4%。E2B dKV NCU为796.7us、3.03waves，较旧BF16 q11快9.8%；但仍255regs、198.93KiB shared、12.49% occupancy、82.5% no-eligible。四卡profile+四卡数值均通过。
+- [08-05 18:15 PST] e276 q14 dKV资源扫描：BQ8与control持平；BKV32慢42%–48%，w4慢7%–9%，s2慢1%–2%。16/16数值正确、峰值相同，无winner；保持BQ16/BKV64/w8/s3，转测BF16x2 relaxed atomic。
+- [08-05 18:20 PST] e277 BF16x2 relaxed微基准：8卡编译成功且全有限，但0.0508–0.0524ms不快于FP32 relaxed；只进入真实dKV验证，不直接晋级。
+- [08-05 18:25 PST] e278 BF16x2 relaxed真实dKV：峰值显存省14.1%，但E2B/MoE慢1.5%–1.9%，且1/8出现dV max_abs=0.25>0.2。拒绝以吞吐/正确性换显存，候选源码已撤回，CPU119与diff check通过。
+- [08-05 18:32 PST] e279/e280 BF16四元素atomic：ISA支持`v2.bf16x2`；首次因8-byte对齐失败，显式分组后又因side-effect组少于线程而重复执行。两份失败签名保留。
+- [08-05 18:36 PST] e281 block512修复重复执行：8卡BF16 max_abs=1.0且全有限，v4与FP32 relaxed均约0.036–0.039ms，进入真实dKV。
+- [08-05 18:42 PST] e282/e283真实dKV两次编译失败分别来自张量索引和kernel内局部函数；均在启动前，逐项修复并由新ID重试。
+- [08-05 18:47 PST] e284 BF16 v4真实dKV：显存-14.1%，但E2B/MoE约慢9%–10%，且1/8 dV超门槛。显式gather/位打包代价过高，停止该轴并撤回源码；CPU119与diff check通过。
+- [08-05 18:50 PST] e285撤回门禁：8张B200各varlen8/8，production恢复稳定。
+- [08-05 18:56 PST] e286/e287 GQA-head grid：E2B q3四卡快2.54%–2.69%，MoE q2快1.75%–1.79%；8/8正确、峰值相同，E2B winner成立。
+- [08-05 19:04 PST] e288 control格式错误：非production区被强制q14，仅保留诊断。e289按真实q14/q11/q9/q8重测raw32–77，八点快2.4%–4.7%、显存/正确性不变。
+- [08-05 19:10 PST] e290 raw80–105继续快3%–5%且显存相同；raw106+虽快5%–39%，FP32 scratch却使显存+16%，不直接晋级。
+- [08-05 19:18 PST] e291/e292 head-grid/q1 + BF16x2：raw106–256同卡快5.4%–37.6%，六点峰值与q1逐字节相同、全部正确；只累计8个head后旧e278数值问题消失。
+- [08-05 19:24 PST] e293/e294 上界与压力：raw288–480约快1%–4.6%；scale8192/16384四点正确且全有限。部分串行后台任务未落盘，失败签名保留。
+- [08-05 19:32 PST] e295/e296：32K/40K/48K/64K收益约2.7%/1.5%/1.7%/1.2%，显存/正确性相同；重型后台任务改独立会话。
+- [08-05 19:48 PST] e297 8个独立长会话全部exit0；候选正确运行到256K且显存与q1相同。96K/128K收益已约1%，192K/256K卡间时延偏差大，必须同卡A/B后再设上界。
+- [08-05 15:05 PST] e298 同卡长端A/B：E2B 64K–192K与MoE 32K–128K只快0.6%–1.3%，显存/正确性相同；不扩长端gate。
+- [08-05 15:10 PST] e299–e301 补齐raw257–639：收益岛收敛为`[257,281)`与`[317,537)`；全点正确、显存相同。
+- [08-05 15:14 PST] e302纠正基线：raw106–223真实production为q4，不是e290–e292使用的q1。新候选相对q4快1.1%–4.7%，同时显存约-14%；raw224/280/317对q1快2.1%–10.6%。最终gate合并为`[106,281)`、`[317,537)`。
+- [08-05 15:19 PST] e303 production晋级后8卡公开API：raw32/105命中head-grid q3，raw106/223/224/280/317/536命中head-grid q1+BF16x2；8/8正确，2.47×–4.33×SDPA，峰值0.041–0.591GiB。
+- [08-05 15:22 PST] e304 scale8192/16384压力与边界8/8通过；raw281/316回BKV16 tuned，raw537回BKV64，未越界。
+- [08-05 15:27 PST] e305 packed/ragged与32K–256K生产矩阵8/8正确；2.42×–4.01×SDPA，长端峰值线性到256K 4.516GiB。
+- [08-05 15:31 PST] e306 post-profile：q3/q1 dKV仍占41.4%/42.6%；均255regs、198.93KiB、12.5% occupancy、约82% no-eligible。q1非合并global sectors达13%，下一轴测试每program分组处理GQA head。
+- [08-05 15:35 PST] e307 GQA group1/2/4/8：raw106与317均是group1最优，group2起变慢；8/8正确、显存相同。候选代码完整撤回，生产保持一head/program。
+- [08-05 15:39 PST] e308 BF16x2完整KV块绕过安全地址：raw106/128/224/317各两卡均慢0.19%–0.63%，显存/正确性相同；源码撤回。
+- [08-05 15:43 PST] e309 head-grid q3改BF16x2：raw32/44/64/76峰值约-14%，但八卡均慢约4%–5%；不以吞吐换显存，不晋级。
+- [08-05 15:47 PST] e310 q1资源：BQ8仅+0.16%–0.21%，BKV32慢38%–47%，s2慢2%–4%；显存/正确性相同，保持BQ16/BKV64/w8/s3。
+- [08-05 15:51 PST] e311 raw106 NCU：dQ为181regs/200.70KiB/12.5%/0spill；forward为255regs/167.94KiB/6.25%/9.87M spill。六条隔离回归正确。
+- [08-05 15:54 PST] e312 dQ/forward资源：forward w8仅+0.19%，其余慢2.8%–12%；dQ BKV32慢22%。无winner，停止三核资源轴。
+- [08-05 15:58 PST] e313 release：CPU147；GPU197 + 7×8/8；compileall、两侧diff check通过。11个代码文件仅修改，无删除/重命名，三代selection合同通过。
+- [08-05 15:47 PST] e314 首轮候选误把单条`raw×64`写成`raw条×64`；总token相同但分布不同，不能与control比较。原始日志保留为诊断，随后同shape重跑。
+- [08-05 15:48 PST] e314纠正：raw281–316八卡同shape A/B全正确；90.35–114.16ms→59.15–74.51ms，延迟-34.5%–34.8%、吞吐+52.6%–53.5%，峰值显存逐字节一致。
+- [08-05 15:49 PST] e315 production：gate合并为`[106,537)`；raw280/281/288/304/316/317/536/537全正确，区间内2.46×–2.59×SDPA，537精确回落BKV64。
+- [08-05 15:50 PST] e316压力/隔离：raw281/304/316×scale8192/16384共6/6正确且全有限；FP16与packed正确保留旧路径。定向CPU138、compileall、diff check通过。
+- [08-05 15:54 PST] e317上边界：raw537–542仅快0.00%–0.16%，543–544略慢；8/8正确、显存逐字节一致。不为噪声级收益扩gate，保持`[106,537)`。
+- [08-05 15:56 PST] e318短端显存轴：BF16x2使峰值-14.12%，但q1/q2/q4/q5均慢；最接近q2仍慢1.62%–3.75%。raw32 q4、raw76 q5各有dV max_abs=0.25失败，不晋级。
+- [08-05 15:57 PST] e319 q2资源：BQ8/stages2/BKV32均慢；w4在raw76/105快0.90%/1.64%，同时显存-14.12%，成为唯一双赢候选。
+- [08-05 15:59 PST] e320长度族100-repeat：raw32/44回退，raw56起转正，raw80/96/105吞吐+1.13%/+1.48%/+1.66%；8/8正确、显存统一-14.12%，进入双seed边界确认。
+- [08-05 16:01 PST] e321双seed：raw72/76/80/96八点吞吐稳定+0.84%–1.46%，显存统一-14.12%、数值全过；保守gate取`[72,106)`。
+- [08-05 16:02 PST] e322 production：raw71/72/105/106边界、scale16384、FP16、packed 8/8正确；新配置raw72为4.398ms/0.079GiB，raw105为8.737ms/0.116GiB。
+- [08-05 16:03 PST] e323 release：CPU149；GPU199 + 7×8/8；定向140、compileall、两侧diff check通过。11个代码文件仅修改，无删除/重命名，三代selection合同通过。
+- [08-05 16:11 PST] e324最终单序列：2K–256K八点2.42×–4.33×SDPA，8/8正确；峰值0.041–4.516GiB线性，q3/q2/q1/BKV64边界正确。
+- [08-05 16:13 PST] e325最终packed：4×2K到total-256K八种分布2.46×–4.02×SDPA，8/8正确；峰值0.141–4.516GiB，batch1新gate未接管。
+- [08-05 16:15 PST] e326 post-profile：q2/w4的dKV/dQ/fwd=40.4%/33.5%/25.8%；dKV为255regs/198.93KiB/6.25% occupancy/85.5% no-eligible，DRAM仅0.61%，约23% global sectors额外。六条隔离/压力正确。
+- [08-05 16:17 PST] e327资源复扫：BQ8持平，stages2慢约1.7%，BKV32/w2分别慢约86%/96%；8/8正确、显存不变，无winner。
+- [08-05 16:20 PST] e328桶内尾块：raw72/105桶首桶尾与scale16384共8/8正确；新q2/w4比旧q3快0.66%–1.64%、显存-14.12%–14.34%，非64整除长度无回退。
+- [08-05 17:22 PST] e329下边界：raw68/70/71双seed吞吐+0.69%–0.77%、显存-14.12%至-14.88%，6/6正确；raw64一例dV max_abs=0.25，故门控不低于68。
+- [08-05 17:24 PST] e330 production：门控扩至`[68,106)`；raw67/68桶边界、scale16384、FP16和packed隔离8/8正确，raw68峰值约0.075GiB。
+- [08-05 17:26 PST] e331 release：CPU150；GPU200 + 7×8/8；定向141、compileall与两侧diff check通过。11个代码文件仅修改，三代selection合同无回退。
+- [08-05 17:28 PST] e332短端FP32 q2/w4：raw32–67八点全正确，但吞吐慢3.10%–7.38%，allocator峰值完全相同；不晋级。
+- [08-05 17:32 PST] e333 packed基线：8种分布2.46×–4.03×SDPA、8/8正确；ragged15K/128K active仅46.9%/28.6%，下一轴为紧凑block table。候选启动被平台GPU配额拒绝，未改生产代码。
+- [08-05 17:36 PST] e334 registry扫描：B200 BF16 E2B精确分段为q3 `[32,68)`、q2 `[68,106)`、q1 `[106,537)`；FP16/MoE旧配置仍可达，H100/H200三角色保持sm90基线。
+- [08-05 17:40 PST] e335显存审计：32K–256K统一18.0625KiB/token，正好对应O+dQ+dK+dV+LSE/Delta；2K q3为21.03KiB/token，多约14%，但现有BF16x2受正确性/吞吐限制。
+- [08-05 17:43 PST] e336 packed设计：prefix-block table可把线性active block映射回sample/local block，理论删除ragged 53%/71%空program；构表与查找开销须GPU A/B，当前不改源码。
+- [08-05 17:45 PST] 提交审计：`benchmarks/README.md`、`registry.py`、`test_registry.py`为`MM`，直接普通commit会漏当前working-tree门控；文档更新后共13个修改文件，交付时必须先统一stage。
+- [08-05 17:48 PST] e337方向去重：BKV32慢86%、拆dK/dV慢35%–36%、Triton split-D无收益；D维拆分会重复score/dP。低风险下一轴仍是packed紧凑网格。
+- [08-05 17:50 PST] e338策略审计：80个registry配置中14个启用B200策略字段，role/dtype/arch/writer-count违规为0；全部仅限sm100 dKV。
+- [08-05 17:52 PST] e339 registry缓存：forward/dQ/dKV每次resolve均约1.40µs，合计约4.2µs；相对2K full约1.1ms不足0.4%，不为此重构。
+- [08-05 17:56 PST] e340文档审计：公开README/varlen/architecture/tests与总refactor计划已同步e331；仅更新当前标签，H100/H200历史与失败结论全部保留。
+- [08-05 18:00 PST] e341正确性裕量：178个production-like BF16x2 passed cell覆盖scale1/8192/16384；dV max-abs最紧用到门槛93.75%，raw64另有0.25失败，故不放宽容差、不下扩gate。
+- [08-05 18:03 PST] e342聚合A/B：raw68–105共26组，吞吐最小/中位/最大+0.664%/+0.894%/+1.662%，26/26为正；显存中位-14.116%，确认小而稳定的双赢。
+- [08-05 18:06 PST] e343 selection fuzz：四profile/两dtype/四batch/38边界/四runtime/三role共14,592次resolve，0 ambiguity、0空洞、0 B200策略泄漏。
+- [08-05 18:08 PST] e344最终聚合：单序列8点2.423×–4.326×、geo2.899×；packed 8分布2.460×–4.023×、geo2.768×；16/16正确，256K均4.516GiB。
+- [08-05 18:10 PST] e345 Amdahl预算：dKV占40.4%；dKV快10%/2×只对应full约+3.81%/+25.31%。后续拒绝full约0.2%的噪声候选，packed空program收益必须实测。
+- [08-05 18:12 PST] e346 Pareto审计：所有production晋级项均吞吐不退、allocator峰值不增且数值通过；BF16显存换吞吐和吞吐换显存的负候选均保留但未晋级。
+- [08-05 18:16 PST] e347证据边界：原`exp/`全忽略；现仅放行B200四份顶层中文文档与refactor plan。raw/profiler/287份run summary仍本地保留，避免混入kernel提交。
+- [08-05 18:19 PST] e348空网格消歧：active约25%的256K ragged，主kernel实测为单序列32.4%，与长度平方和理论33.337%一致；空CTA成本不可测，prefix-block降为短端低优先级。
+- [08-05 18:22 PST] e349 shared边界：NCU block limit为register2/shared1/warps16；双驻留需shared从198.93降至≤113.5KiB（-42.9%）。BKV32已慢86%，局部轴不可行。
+- [08-05 18:25 PST] e350登记：q2/s1是唯一未测且可能跨双驻留阈值的局部点；raw68/96双seed，任一资源/数值/吞吐门禁失败即停止局部轴。GPU配额恢复前不改代码。
+- [08-05 18:28 PST] e351最终验收：CPU150/50skip；GPU复用e331的200+7×8/8；16/16最终矩阵、364 JSON、9 XML、14,592 selection均通过。14 tracked+5新文档，无删除/重命名。

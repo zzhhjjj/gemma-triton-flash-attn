@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one ephemeral B200 D512 varlen dKV registry candidate.
+"""Run one ephemeral B200 D512 varlen registry candidate.
 
 This is an experiment-only wrapper around the canonical varlen benchmark. It
 registers one higher-priority, process-local candidate, then calls the same
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import shlex
 import sys
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument(
+        "--role",
+        choices=("forward", "backward_dq", "backward_dkv"),
+        default="backward_dkv",
+    )
+    parser.add_argument(
         "--profile",
         choices=("gemma4_e2b_text_full", "gemma4_moe_text_full"),
         required=True,
@@ -59,23 +65,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260801)
+    parser.add_argument("--grad-output-scale", type=float, default=1.0)
     parser.add_argument("--block-q", type=int, required=True)
     parser.add_argument("--block-kv", type=int, required=True)
     parser.add_argument("--num-warps", type=int, required=True)
     parser.add_argument("--num-stages", type=int, required=True)
     parser.add_argument("--q-splits", type=int, default=1)
+    parser.add_argument(
+        "--separate-dkv-scratch",
+        action="store_true",
+        help="use separate dK/dV scratch, matching the production q-split path",
+    )
+    parser.add_argument(
+        "--relaxed-dkv-atomics",
+        action="store_true",
+        help="use relaxed dK/dV atomics for the B200 q-split candidate",
+    )
+    parser.add_argument(
+        "--split-gqa-heads",
+        action="store_true",
+        help="map GQA heads into the dKV grid instead of a static inner loop",
+    )
+    parser.add_argument(
+        "--bf16x2-dkv-atomics",
+        action="store_true",
+        help="use relaxed BF16x2 atomics and BF16 dK/dV buffers",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     args = parser.parse_args()
     if args.warmup < 0 or args.repetitions <= 0:
         parser.error("warmup must be non-negative and repetitions positive")
+    if not math.isfinite(args.grad_output_scale) or args.grad_output_scale <= 0:
+        parser.error("grad-output-scale must be finite and positive")
+    if args.separate_dkv_scratch and (
+        args.role != "backward_dkv"
+        or (args.q_splits <= 1 and not args.split_gqa_heads)
+    ):
+        parser.error(
+            "--separate-dkv-scratch requires --role backward_dkv and --q-splits > 1"
+        )
+    if args.relaxed_dkv_atomics and (
+        args.role != "backward_dkv"
+        or (args.q_splits <= 1 and not args.split_gqa_heads)
+    ):
+        parser.error(
+            "--relaxed-dkv-atomics requires --role backward_dkv and --q-splits > 1"
+        )
+    if args.split_gqa_heads and args.role != "backward_dkv":
+        parser.error("--split-gqa-heads requires --role backward_dkv")
+    if args.bf16x2_dkv_atomics and (
+        args.role != "backward_dkv"
+        or not args.separate_dkv_scratch
+        or args.dtype != "bfloat16"
+    ):
+        parser.error(
+            "--bf16x2-dkv-atomics requires BF16 backward_dkv and "
+            "--separate-dkv-scratch"
+        )
     return args
 
 
 def register_candidate(args: argparse.Namespace) -> str:
     candidate_id = (
         f"candidate.{args.experiment_id}.triton_gqa_varlen_v1."
-        f"backward_dkv.sm100.d512.bq{args.block_q}.bkv{args.block_kv}."
-        f"w{args.num_warps}.s{args.num_stages}.qs{args.q_splits}"
+        f"{args.role}.sm100.d512.bq{args.block_q}.bkv{args.block_kv}."
+        f"w{args.num_warps}.s{args.num_stages}.qs{args.q_splits}."
+        f"separate{int(args.separate_dkv_scratch)}."
+        f"relaxed{int(args.relaxed_dkv_atomics)}."
+        f"splitgqa{int(args.split_gqa_heads)}."
+        f"bf16x2{int(args.bf16x2_dkv_atomics)}"
     )
     DEFAULT_REGISTRY.register_config(
         ConfigRegistration(
@@ -94,13 +152,17 @@ def register_candidate(args: argparse.Namespace) -> str:
             evidence_status="baseline",
             evidence=f"ephemeral candidate from {args.experiment_id}",
             config_kind="tuned_override",
-            role="backward_dkv",
+            role=args.role,
             priority=1000,
             dtypes=frozenset({args.dtype}),
             training_modes=frozenset({True}),
             gpu_name_patterns=frozenset({"B200"}),
             torch_version_prefixes=frozenset({"2.11"}),
             triton_version_prefixes=frozenset({"3.6"}),
+            separate_dkv_scratch=args.separate_dkv_scratch,
+            relaxed_dkv_atomics=args.relaxed_dkv_atomics,
+            split_gqa_heads=args.split_gqa_heads,
+            bf16x2_dkv_atomics=args.bf16x2_dkv_atomics,
         )
     )
     return candidate_id
@@ -132,12 +194,14 @@ def main() -> int:
         repetitions=args.repetitions,
         seed=args.seed,
         dense_peak_tflops=float(hardware_peak["dense_tensor_tflops"]),
+        grad_output_scale=args.grad_output_scale,
     )
     completed = datetime.now(timezone.utc)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "status": "passed",
         "experiment_id": args.experiment_id,
+        "candidate_role": args.role,
         "candidate_config_id": candidate_id,
         "started_at_utc": started.isoformat(),
         "completed_at_utc": completed.isoformat(),
@@ -146,10 +210,17 @@ def main() -> int:
             "seed": args.seed,
             "warmup": args.warmup,
             "repetitions": args.repetitions,
+            "grad_output_scale": args.grad_output_scale,
             "correctness_before_timing": True,
             "reference_timed": True,
+            "memory_peak_measured_separately_from_timing": True,
+            "memory_metric": "CUDA allocator peak growth above resident baseline",
             "output_is_exclusive": True,
             "candidate_is_ephemeral": True,
+            "separate_dkv_scratch": args.separate_dkv_scratch,
+            "relaxed_dkv_atomics": args.relaxed_dkv_atomics,
+            "split_gqa_heads": args.split_gqa_heads,
+            "bf16x2_dkv_atomics": args.bf16x2_dkv_atomics,
         },
         "source": source,
         "runtime": runtime,
@@ -160,6 +231,7 @@ def main() -> int:
         (
             completed.strftime("%Y%m%dT%H%M%S%fZ"),
             slug(args.profile),
+            args.role,
             f"bq{args.block_q}",
             slug(runtime["gpu_name"]),
             str(runtime["gpu_arch"]),
@@ -177,7 +249,13 @@ def main() -> int:
             {
                 "candidate_config_id": candidate_id,
                 "triton_median_ms": triton_record["latency"]["median"],
+                "triton_incremental_peak_allocated_bytes": triton_record["memory"][
+                    "incremental_peak_allocated_bytes"
+                ],
                 "sdpa_median_ms": sdpa_record["latency"]["median"],
+                "sdpa_incremental_peak_allocated_bytes": sdpa_record["memory"][
+                    "incremental_peak_allocated_bytes"
+                ],
                 "speedup": measurements["speedup_vs_torch_sdpa"],
             },
             sort_keys=True,

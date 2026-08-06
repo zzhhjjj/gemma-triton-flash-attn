@@ -1861,12 +1861,23 @@ def _flash_attn_gqa_varlen_bwd_dkv_packed_kernel(
     IS_CAUSAL: tl.constexpr,
     SLIDE_SIZE: tl.constexpr,
     Q_SPLITS: tl.constexpr,
+    RELAXED_ATOMICS: tl.constexpr,
+    SPLIT_GQA_HEADS: tl.constexpr,
+    BF16X2_ATOMICS: tl.constexpr,
 ):
     kv_block_idx = tl.program_id(0)
     bkvh_idx = tl.program_id(1)
     split_idx = tl.program_id(2)
     kv_h_idx = bkvh_idx % N_KV_HEADS
     b_idx = bkvh_idx // N_KV_HEADS
+    if SPLIT_GQA_HEADS:
+        q_split_idx = split_idx // GQA_RATIO
+        qh_start = split_idx % GQA_RATIO
+        GQA_LOOP: tl.constexpr = 1
+    else:
+        q_split_idx = split_idx
+        qh_start = 0
+        GQA_LOOP: tl.constexpr = GQA_RATIO
 
     # Per-sample bounds (hoisted outside the GQA static_range).
     seq_start_q = tl.load(CuSeqlensQ_ptr + b_idx)
@@ -1880,27 +1891,8 @@ def _flash_attn_gqa_varlen_bwd_dkv_packed_kernel(
         # OOR kv_block for this sample — no atomic writes, no stores.
         return
 
-    k_h_base = K_ptr + kv_h_idx * stride_kh
-    v_h_base = V_ptr + kv_h_idx * stride_vh
-    dk_h_base = dK_ptr + kv_h_idx * stride_dkh
-    dv_h_base = dV_ptr + kv_h_idx * stride_dvh
-
     kv_local = kv_block_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
     kv_mask = kv_local < seq_len_k
-    kv_global = seq_start_k + kv_local
-    d_range = tl.arange(0, HEAD_DIM)
-
-    # Load K, V once — reused across all GQA_RATIO Q heads.
-    k_ptrs = k_h_base + kv_global[:, None] * stride_kt + d_range[None, :] * stride_kd
-    k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
-    v_ptrs = v_h_base + kv_global[:, None] * stride_vt + d_range[None, :] * stride_vd
-    v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
-
-    dk_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
-    dv_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
-
-    LOG2E: tl.constexpr = 1.4426950408889634
-    scale_log2e = scale * LOG2E
 
     # Q iteration bounds (seq-local). Symmetric to varlen fwd/dQ.
     if IS_CAUSAL:
@@ -1920,17 +1912,41 @@ def _flash_attn_gqa_varlen_bwd_dkv_packed_kernel(
     if Q_SPLITS > 1:
         total_q_blocks = (q_loop_end_local - q_start_local + BLOCK_Q - 1) // BLOCK_Q
         blocks_per_split = (total_q_blocks + Q_SPLITS - 1) // Q_SPLITS
-        q_lo_local = q_start_local + split_idx * blocks_per_split * BLOCK_Q
+        q_lo_local = q_start_local + q_split_idx * blocks_per_split * BLOCK_Q
         q_hi_local = tl.minimum(
             q_loop_end_local,
-            q_start_local + (split_idx + 1) * blocks_per_split * BLOCK_Q,
+            q_start_local + (q_split_idx + 1) * blocks_per_split * BLOCK_Q,
         )
     else:
         q_lo_local = q_start_local
         q_hi_local = q_loop_end_local
 
+    # Tail splits with no Q blocks must not load K/V or issue zero atomics.
+    if q_lo_local >= q_hi_local:
+        return
+
+    k_h_base = K_ptr + kv_h_idx * stride_kh
+    v_h_base = V_ptr + kv_h_idx * stride_vh
+    dk_h_base = dK_ptr + kv_h_idx * stride_dkh
+    dv_h_base = dV_ptr + kv_h_idx * stride_dvh
+    kv_global = seq_start_k + kv_local
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # Load K, V once — reused across all GQA_RATIO Q heads.
+    k_ptrs = k_h_base + kv_global[:, None] * stride_kt + d_range[None, :] * stride_kd
+    k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+    v_ptrs = v_h_base + kv_global[:, None] * stride_vt + d_range[None, :] * stride_vd
+    v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+
+    dk_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+    dv_acc = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
     # Outer loop: Q heads (unrolled). Each contributes into dk_acc/dv_acc.
-    for qh_offset in tl.static_range(GQA_RATIO):
+    for qh_loop in tl.static_range(GQA_LOOP):
+        qh_offset = qh_start + qh_loop
         q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
         q_h_base = Q_ptr + q_h_idx * stride_qh
         do_h_base = dO_ptr + q_h_idx * stride_doh
@@ -1977,11 +1993,31 @@ def _flash_attn_gqa_varlen_bwd_dkv_packed_kernel(
 
     dk_ptrs = dk_h_base + kv_global[:, None] * stride_dkt + d_range[None, :] * stride_dkd
     dv_ptrs = dv_h_base + kv_global[:, None] * stride_dvt + d_range[None, :] * stride_dvd
-    if Q_SPLITS > 1:
+    if Q_SPLITS > 1 or SPLIT_GQA_HEADS:
         # Triton 3.6: atomic_add does not support bf16. dk_acc/dv_acc are fp32;
-        # when Q_SPLITS > 1 the caller allocates dK/dV as fp32 buffers.
-        tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
-        tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
+        # when Q_SPLITS > 1 the caller provides supported scratch buffers.
+        if BF16X2_ATOMICS:
+            atomic_mask = kv_mask[:, None]
+            safe_dk_ptrs = tl.where(atomic_mask, dk_ptrs, dk_h_base)
+            safe_dv_ptrs = tl.where(atomic_mask, dv_ptrs, dv_h_base)
+            dk_values = tl.where(atomic_mask, dk_acc, 0.0).to(tl.bfloat16)
+            dv_values = tl.where(atomic_mask, dv_acc, 0.0).to(tl.bfloat16)
+            _ = tl.inline_asm_elementwise(
+                "atom.global.gpu.relaxed.add.noftz.bf16x2 $0, [$1], $3;",
+                "=r,l,l,r", [safe_dk_ptrs.to(tl.uint64), dk_values],
+                dtype=tl.bfloat16, is_pure=False, pack=2,
+            )
+            _ = tl.inline_asm_elementwise(
+                "atom.global.gpu.relaxed.add.noftz.bf16x2 $0, [$1], $3;",
+                "=r,l,l,r", [safe_dv_ptrs.to(tl.uint64), dv_values],
+                dtype=tl.bfloat16, is_pure=False, pack=2,
+            )
+        elif RELAXED_ATOMICS:
+            tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None], sem="relaxed")
+            tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None], sem="relaxed")
+        else:
+            tl.atomic_add(dk_ptrs, dk_acc, mask=kv_mask[:, None])
+            tl.atomic_add(dv_ptrs, dv_acc, mask=kv_mask[:, None])
     else:
         tl.store(dk_ptrs, dk_acc.to(k_block.dtype), mask=kv_mask[:, None])
         tl.store(dv_ptrs, dv_acc.to(v_block.dtype), mask=kv_mask[:, None])
@@ -2574,7 +2610,7 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         )
 
         # --- dK/dV kernel (pack-GQA) ---
-        selected_dkv = _resolve_attention_config(
+        resolved_dkv = _resolve_attention_config(
             q,
             k,
             causal=causal,
@@ -2586,7 +2622,14 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             query_length=max_seqlen_q,
             key_length=max_seqlen_k,
             telemetry=ctx.selection_telemetry,
-        ).config
+        )
+        selected_dkv = resolved_dkv.config
+        separate_dkv_scratch = resolved_dkv.config_registration.separate_dkv_scratch
+        relaxed_dkv_atomics = resolved_dkv.config_registration.relaxed_dkv_atomics
+        split_gqa_heads = resolved_dkv.config_registration.split_gqa_heads
+        bf16x2_dkv_atomics = resolved_dkv.config_registration.bf16x2_dkv_atomics
+        if bf16x2_dkv_atomics and k.dtype != torch.bfloat16:
+            raise RuntimeError("BF16x2 dKV atomics require BF16 inputs")
         BLOCK_KV_DKV = selected_dkv.block_kv
         BLOCK_Q_DKV = selected_dkv.block_q
         num_warps_dkv = selected_dkv.num_warps
@@ -2596,12 +2639,21 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
 
         Q_SPLITS_DKV = selected_dkv.q_splits
 
-        grid_dkv = (triton.cdiv(max_seqlen_k, BLOCK_KV_DKV), B * H_KV, Q_SPLITS_DKV)
-
-        if Q_SPLITS_DKV > 1:
-            # Triton 3.6 atomic_add doesn't support bf16 — accumulate in fp32
-            dkv = torch.zeros((2,) + k.shape, dtype=torch.float32, device=k.device)
-            dk, dv = dkv[0], dkv[1]
+        dkv_grid_splits = Q_SPLITS_DKV * (GQA_RATIO if split_gqa_heads else 1)
+        grid_dkv = (triton.cdiv(max_seqlen_k, BLOCK_KV_DKV), B * H_KV, dkv_grid_splits)
+        use_dkv_atomics = Q_SPLITS_DKV > 1 or split_gqa_heads
+        if use_dkv_atomics:
+            # Triton 3.6 atomic_add doesn't support bf16. FP16 inputs can safely
+            # accumulate into their own output dtype; BF16 keeps FP32 range.
+            if separate_dkv_scratch:
+                scratch_dtype = k.dtype if (
+                    k.dtype == torch.float16 or bf16x2_dkv_atomics
+                ) else torch.float32
+                dk = torch.zeros_like(k, dtype=scratch_dtype)
+                dv = torch.zeros_like(v, dtype=scratch_dtype)
+            else:
+                dkv = torch.zeros((2,) + k.shape, dtype=torch.float32, device=k.device)
+                dk, dv = dkv[0], dkv[1]
         else:
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
@@ -2623,12 +2675,23 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             GQA_RATIO=GQA_RATIO,
             IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
             Q_SPLITS=Q_SPLITS_DKV,
+            RELAXED_ATOMICS=relaxed_dkv_atomics,
+            SPLIT_GQA_HEADS=split_gqa_heads,
+            BF16X2_ATOMICS=bf16x2_dkv_atomics,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
-        if Q_SPLITS_DKV > 1:
-            dk = dk.to(k.dtype)
-            dv = dv.to(v.dtype)
+        del delta
+
+        if use_dkv_atomics:
+            if separate_dkv_scratch:
+                dk_out = dk.to(k.dtype)
+                del dk
+                dv_out = dv.to(v.dtype)
+                dk, dv = dk_out, dv_out
+            else:
+                dk = dk.to(k.dtype)
+                dv = dv.to(v.dtype)
 
         return dq, dk, dv, None, None, None, None, None, None
 

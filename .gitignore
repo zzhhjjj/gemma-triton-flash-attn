@@ -40,8 +40,17 @@ Thumbs.db
 # context/
 # skills/
 
-# experiment outputs
-exp
+# Experiment outputs stay local; keep only the human-readable project state.
+exp/*
+!exp/b200_speedup/
+exp/b200_speedup/*
+!exp/b200_speedup/plan.md
+!exp/b200_speedup/results.md
+!exp/b200_speedup/working_notes.md
+!exp/b200_speedup/log_index.md
+!exp/refactor/
+exp/refactor/*
+!exp/refactor/plan.md
 
 # Profiling output
 *.nsys-rep

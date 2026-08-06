@@ -321,6 +321,25 @@ class TensorErrorMetrics:
         return asdict(self)
 
 
+_DOT_CHUNK_ELEMENTS = 1 << 30
+
+
+def _int32_safe_dot(actual: object, expected: object) -> object:
+    """Accumulate dot products without exceeding cuBLAS' int32 length limit."""
+    import torch
+
+    if actual.numel() <= _DOT_CHUNK_ELEMENTS:
+        return torch.dot(actual, expected)
+    partials = [
+        torch.dot(
+            actual[start : start + _DOT_CHUNK_ELEMENTS],
+            expected[start : start + _DOT_CHUNK_ELEMENTS],
+        ).double()
+        for start in range(0, actual.numel(), _DOT_CHUNK_ELEMENTS)
+    ]
+    return torch.stack(partials).sum()
+
+
 def compare_tensors(actual: object, expected: object) -> TensorErrorMetrics:
     """Compare Torch tensors with all reductions accumulated in FP32."""
     import torch
@@ -342,7 +361,7 @@ def compare_tensors(actual: object, expected: object) -> TensorErrorMetrics:
     if denominator.item() <= 1e-24:
         cosine = 1.0 if torch.equal(actual_f, expected_f) else 0.0
     else:
-        cosine = torch.dot(actual_f, expected_f).div(denominator).item()
+        cosine = _int32_safe_dot(actual_f, expected_f).div(denominator).item()
     expected_scale = max(expected_norm_t.item(), 1e-12)
     return TensorErrorMetrics(
         cosine=cosine,

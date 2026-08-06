@@ -47,8 +47,8 @@ production backward 不再单独启动 `_delta_kernel`。
 ## 保留的设计结论
 
 - dQ 每个 Q head 只有一个 owning KV head，不需要 pack-GQA；
-- dK/dV 会被同一 GQA group 的多个 Q head 累积，packed kernel 用内部
-  `tl.static_range` 消除中间 expand buffer 与常规原子冲突；
+- dK/dV 会累积同一GQA group的多个Q head；基础路径在program内展开，
+  B200部分区间把Q head映射进grid并用relaxed atomic汇总；两者都不需要expand buffer；
 - forward 通过 `STORE_LSE` 区分 inference/training，训练保存 LSE，
   inference 避免额外 HBM 写；
 - `torch.autograd.Function` 负责精确保存 q/k/v/o/lse，并让每次调用
@@ -84,7 +84,10 @@ sm100 compile-safe base
 - base 负责 compile-safe，product override 必须有对应实机与软件栈证据；
 - 未识别产品使用 base，不猜测复用 tuned config。
 
-当前 B200 D512 override 为 BQ16/BKV16/warps4/stages2/Q_SPLITS1；完整证据见 `exp/b200_speedup/results.md`。H100 性能表属于历史数据，H200 尚待重新认证。
+当前B200 varlen D512 dKV是分层override：BQ16/BKV16/w4/s2为安全回退，
+已验证网格使用BKV64/w4/s3；E2B BF16 batch1进一步按raw-grid选择
+head-grid q3、q2/w4+BF16x2或q1+BF16x2。完整边界与证据见
+`exp/b200_speedup/results.md`。H100性能表属于历史数据，H200尚待重新认证。
 
 ## Target model attention shapes
 

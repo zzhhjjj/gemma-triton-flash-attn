@@ -48,6 +48,10 @@ def test_summary_aggregates_selection_counts_and_is_json_serializable() -> None:
     assert len(snapshot["selections"]) == 1
     assert snapshot["selections"][0]["count"] == 2
     assert snapshot["selections"][0]["config_kind"] == "base"
+    assert snapshot["selections"][0]["separate_dkv_scratch"] is False
+    assert snapshot["selections"][0]["relaxed_dkv_atomics"] is False
+    assert snapshot["selections"][0]["split_gqa_heads"] is False
+    assert snapshot["selections"][0]["bf16x2_dkv_atomics"] is False
     assert "debug_events" not in snapshot
     assert json.loads(telemetry.to_json()) == snapshot
     assert "forward.sm100.d512" in telemetry.format_summary()
@@ -66,6 +70,10 @@ def test_debug_retains_one_full_explanation_per_distinct_selection() -> None:
     assert event["spec"]["head_dim"] == 512
     assert event["runtime"]["gpu_name"] == "NVIDIA B200"
     assert event["resolution"]["config_kind"] == "base"
+    assert event["resolution"]["separate_dkv_scratch"] is False
+    assert event["resolution"]["relaxed_dkv_atomics"] is False
+    assert event["resolution"]["split_gqa_heads"] is False
+    assert event["resolution"]["bf16x2_dkv_atomics"] is False
     assert event["resolution"]["implementation_candidates"]
 
 
@@ -89,6 +97,24 @@ def test_summary_distinguishes_materialized_q_split_configs() -> None:
     rows = telemetry.snapshot()["selections"]
     assert len(rows) == 2
     assert {row["q_splits"] for row in rows} == {1, 8}
+
+
+def test_summary_records_b200_qsplit_scratch_policy() -> None:
+    spec = DEFAULT_MODEL_PROFILES.get("gemma4_e2b_text_full").make_spec(
+        dtype="bf16", training=True, query_length=8192, layout="thd"
+    )
+    resolution = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert resolution.config_registration.separate_dkv_scratch
+
+    with capture_attention_selection() as telemetry:
+        record_attention_selection(spec, SM100_RUNTIME, resolution)
+
+    row = telemetry.snapshot()["selections"][0]
+    assert row["q_splits"] == 1
+    assert row["separate_dkv_scratch"] is True
+    assert row["relaxed_dkv_atomics"] is True
+    assert row["split_gqa_heads"] is True
+    assert row["bf16x2_dkv_atomics"] is True
 
 
 def test_debug_distinguishes_exact_shapes_with_the_same_launch_config() -> None:

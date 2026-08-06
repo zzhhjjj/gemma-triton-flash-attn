@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+import flash_attn.performance as performance
 from flash_attn.performance import (
     UnknownHardwarePeak,
     achieved_tflops,
@@ -152,6 +153,15 @@ def test_tensor_comparison_accumulates_in_fp32() -> None:
     assert metrics.cosine == pytest.approx(1.0)
     assert metrics.max_abs == 0.0
     assert math.isfinite(metrics.relative_l2)
+
+
+def test_tensor_comparison_chunks_dot_above_int32_safe_limit(monkeypatch) -> None:
+    monkeypatch.setattr(performance, "_DOT_CHUNK_ELEMENTS", 2)
+    expected = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+    actual = expected.clone()
+    metrics = compare_tensors(actual, expected)
+    assert metrics.cosine == pytest.approx(1.0)
+    assert metrics.relative_l2 == 0.0
 
 
 def test_json_results_are_never_overwritten(tmp_path) -> None:

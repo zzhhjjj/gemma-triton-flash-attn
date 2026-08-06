@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import shlex
 import sys
@@ -84,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260801)
+    parser.add_argument(
+        "--grad-output-scale",
+        type=float,
+        default=1.0,
+        help="Scale dOutput for backward correctness stress tests.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--output-root", type=Path, default=REPO_ROOT / "exp" / "b200_speedup" / "runs"
@@ -97,6 +104,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(error))
     if args.warmup < 0 or args.repetitions <= 0:
         parser.error("warmup must be non-negative and repetitions positive")
+    if not math.isfinite(args.grad_output_scale) or args.grad_output_scale <= 0:
+        parser.error("grad-output-scale must be finite and positive")
     if (args.dense_peak_tflops is None) != (args.hbm_bandwidth_gbps is None):
         parser.error("explicit peak override requires peak and HBM bandwidth")
     if args.dense_peak_tflops is not None and (
@@ -115,6 +124,18 @@ def metric_verdict(
     expected: torch.Tensor,
     tolerance: dict[str, float],
 ) -> dict[str, object]:
+    actual_non_finite = int((~torch.isfinite(actual)).sum().item())
+    expected_non_finite = int((~torch.isfinite(expected)).sum().item())
+    if actual_non_finite or expected_non_finite:
+        return {
+            "passed": False,
+            "failed_metrics": ["finite"],
+            "metrics": {
+                "actual_non_finite": actual_non_finite,
+                "expected_non_finite": expected_non_finite,
+            },
+            "tolerance": tolerance,
+        }
     metrics = compare_tensors(actual, expected).to_dict()
     failures: list[str] = []
     if metrics["cosine"] < tolerance["cosine_min"]:
@@ -153,6 +174,32 @@ def measure_cuda_ms(
     return latency_summary(
         [start.elapsed_time(end) for start, end in zip(starts, ends)]
     )
+
+
+def measure_cuda_peak_memory(
+    function: Callable[[], object], *, device: torch.device
+) -> dict[str, int]:
+    """Measure peak CUDA allocator growth above the resident input baseline."""
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    baseline_allocated = torch.cuda.memory_allocated(device)
+    baseline_reserved = torch.cuda.memory_reserved(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    output = function()
+    torch.cuda.synchronize(device)
+    peak_allocated = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+    del output
+    return {
+        "baseline_allocated_bytes": baseline_allocated,
+        "peak_allocated_bytes": peak_allocated,
+        "incremental_peak_allocated_bytes": max(
+            0, peak_allocated - baseline_allocated
+        ),
+        "baseline_reserved_bytes": baseline_reserved,
+        "peak_reserved_bytes": peak_reserved,
+        "incremental_peak_reserved_bytes": max(0, peak_reserved - baseline_reserved),
+    }
 
 
 def fresh_training_tensors(
@@ -262,7 +309,7 @@ def grid_analysis(
             q_splits = 1
         else:
             block_size = int(raw["block_kv"])
-            heads = int(raw["kv_heads"])
+            heads = int(raw["q_heads"] if raw["split_gqa_heads"] else raw["kv_heads"])
             q_splits = int(raw["q_splits"])
         rows.append(
             {
@@ -294,6 +341,7 @@ def benchmark_cell(
     repetitions: int,
     seed: int,
     dense_peak_tflops: float,
+    grad_output_scale: float = 1.0,
 ) -> dict[str, object]:
     profile = DEFAULT_MODEL_PROFILES.get(profile_id)
     dtype = dtype_from_name(dtype_name)
@@ -387,7 +435,7 @@ def benchmark_cell(
             window_size=effective_window,
         )
         torch.manual_seed(seed + 1)
-        grad_out = torch.randn_like(expected)
+        grad_out = torch.randn_like(expected).mul_(grad_output_scale)
         expected.backward(grad_out)
 
         q_tri, k_tri, v_tri = fresh_training_tensors(q_data, k_data, v_data)
@@ -407,6 +455,11 @@ def benchmark_cell(
             )
             actual.backward(grad_out)
         checks["output"] = metric_verdict(actual, expected, OUTPUT_TOLERANCE)
+        scaled_grad_tolerance = {
+            **GRAD_TOLERANCE,
+            "max_abs": GRAD_TOLERANCE["max_abs"] * grad_output_scale,
+            "mean_abs": GRAD_TOLERANCE["mean_abs"] * grad_output_scale,
+        }
         for name, actual_grad, expected_grad in (
             ("dq", q_tri.grad, q_ref.grad),
             ("dk", k_tri.grad, k_ref.grad),
@@ -414,7 +467,9 @@ def benchmark_cell(
         ):
             if actual_grad is None or expected_grad is None:
                 raise AssertionError(f"missing {name} gradient")
-            checks[name] = metric_verdict(actual_grad, expected_grad, GRAD_TOLERANCE)
+            checks[name] = metric_verdict(
+                actual_grad, expected_grad, scaled_grad_tolerance
+            )
         assert_correctness(checks)
 
         q_bench, k_bench, v_bench = fresh_training_tensors(q_data, k_data, v_data)
@@ -451,6 +506,8 @@ def benchmark_cell(
 
     telemetry = recorder.snapshot()
     validate_varlen_telemetry(telemetry, phase=phase)
+    triton_memory = measure_cuda_peak_memory(run_triton, device=device)
+    sdpa_memory = measure_cuda_peak_memory(run_sdpa, device=device)
     triton_latency = measure_cuda_ms(
         run_triton, warmup=warmup, repetitions=repetitions
     )
@@ -466,10 +523,13 @@ def benchmark_cell(
     triton_median_ms = float(triton_latency["median"])
     sdpa_median_ms = float(sdpa_latency["median"])
 
-    def performance_record(latency: dict[str, object]) -> dict[str, object]:
+    def performance_record(
+        latency: dict[str, object], memory: dict[str, int]
+    ) -> dict[str, object]:
         median_ms = float(latency["median"])
         return {
             "latency": latency,
+            "memory": memory,
             "useful_tokens_per_second": total_tokens / (median_ms * 1e-3),
             "semantic_tflops": achieved_tflops(semantic_flops, median_ms),
             "attention_kernel_mfu_percent": mfu_percent(
@@ -494,6 +554,7 @@ def benchmark_cell(
             "max_seqlen_q": max_seqlen,
             "max_seqlen_k": max_seqlen,
             "phase": phase,
+            "grad_output_scale": grad_output_scale,
         },
         "flops": {
             "semantic_algorithmic": semantic_flops,
@@ -506,8 +567,10 @@ def benchmark_cell(
         "registry_telemetry": telemetry,
         "grid_analysis": grid_analysis(telemetry, lengths),
         "measurements": {
-            "triton_registry_public_api": performance_record(triton_latency),
-            "torch_sdpa_per_sample": performance_record(sdpa_latency),
+            "triton_registry_public_api": performance_record(
+                triton_latency, triton_memory
+            ),
+            "torch_sdpa_per_sample": performance_record(sdpa_latency, sdpa_memory),
             "speedup_vs_torch_sdpa": sdpa_median_ms / triton_median_ms,
         },
         "reference": {
@@ -566,6 +629,7 @@ def main() -> int:
         repetitions=args.repetitions,
         seed=args.seed,
         dense_peak_tflops=float(hardware_peak["dense_tensor_tflops"]),
+        grad_output_scale=args.grad_output_scale,
     )
     completed = datetime.now(timezone.utc)
     payload = {
@@ -578,8 +642,11 @@ def main() -> int:
             "seed": args.seed,
             "warmup": args.warmup,
             "repetitions": args.repetitions,
+            "grad_output_scale": args.grad_output_scale,
             "correctness_before_timing": True,
             "reference_timed": True,
+            "memory_peak_measured_separately_from_timing": True,
+            "memory_metric": "CUDA allocator peak growth above resident baseline",
             "sliding_masks_prebuilt_outside_timing": True,
             "output_is_exclusive": True,
         },
@@ -602,13 +669,19 @@ def main() -> int:
     write_json_exclusive(result_path, payload)
     measurement = cell["measurements"]["triton_registry_public_api"]
     sdpa = cell["measurements"]["torch_sdpa_per_sample"]
+    triton_peak_gib = (
+        measurement["memory"]["incremental_peak_allocated_bytes"] / (1 << 30)
+    )
+    sdpa_peak_gib = sdpa["memory"]["incremental_peak_allocated_bytes"] / (1 << 30)
     print(f"result: {result_path}")
     print(
         f"{args.profile} lengths={list(args.lengths)} {args.phase}: "
         f"{measurement['latency']['median']:.4f} ms, "
         f"{measurement['useful_tokens_per_second'] / 1e6:.3f} Mtok/s, "
         f"MFU={measurement['attention_kernel_mfu_percent']:.2f}%, "
+        f"peak_delta={triton_peak_gib:.3f} GiB, "
         f"SDPA={sdpa['latency']['median']:.4f} ms, "
+        f"SDPA_peak_delta={sdpa_peak_gib:.3f} GiB, "
         f"speedup={cell['measurements']['speedup_vs_torch_sdpa']:.2f}x"
     )
     for row in cell["grid_analysis"]:

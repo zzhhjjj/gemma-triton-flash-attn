@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from flash_attn.profiles import DEFAULT_MODEL_PROFILES
@@ -188,6 +190,7 @@ def test_h200_training_roles_keep_sm90_compile_safe_base(
     assert result.config_registration.evidence_status == "baseline"
     assert "h100_tuned" not in result.config_registration.id
     assert "b200_tuned" not in result.config_registration.id
+    assert not result.config_registration.separate_dkv_scratch
     assert (
         result.config.block_q,
         result.config.block_kv,
@@ -231,6 +234,8 @@ def test_training_roles_have_independent_h100_and_b200_records(
     assert ".sm90." in sm90.config_registration.id
     assert ".sm100." in sm100.config_registration.id
     assert sm90.config_registration.id != sm100.config_registration.id
+    assert not sm90.config_registration.separate_dkv_scratch
+    assert not sm100.config_registration.separate_dkv_scratch
     if profile_id == "gemma4_e2b_text_full" and role == "backward_dkv":
         assert "backward_dkv_b200_tuned" in sm100.config_registration.id
         assert (sm100.config.block_q, sm100.config.block_kv) == (16, 16)
@@ -255,6 +260,273 @@ def test_backward_roles_resolve_independently() -> None:
     assert dkv.config.q_splits == 1
 
 
+@pytest.mark.parametrize(
+    "profile_id,query_length,batch_size,expected_raw_grid,expected_block_kv",
+    [
+        ("gemma4_e2b_text_full", 1024, 1, 16, 16),
+        ("gemma4_e2b_text_full", 2048, 4, 128, 64),
+        ("gemma4_e2b_text_full", 4096, 4, 256, 64),
+        ("gemma4_e2b_text_full", 4096, 7, 448, 16),
+        ("gemma4_e2b_text_full", 8192, 7, 896, 64),
+        ("gemma4_moe_text_full", 2048, 4, 256, 64),
+        ("gemma4_moe_text_full", 4096, 4, 512, 64),
+    ],
+)
+def test_d512_b200_bkv64_uses_verified_grid_ranges(
+    profile_id: str,
+    query_length: int,
+    batch_size: int,
+    expected_raw_grid: int,
+    expected_block_kv: int,
+) -> None:
+    spec = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="bf16",
+        training=True,
+        query_length=query_length,
+        batch_size=batch_size,
+        layout="thd",
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert ConfigRegistration.grid_size(spec, 64) == expected_raw_grid
+    assert result.config.block_q == 16
+    assert result.config.block_kv == expected_block_kv
+    assert result.config.q_splits == 1
+    if expected_block_kv == 64:
+        assert "bkv64_grid" in result.config_registration.id
+        assert result.config.num_stages == 3
+    else:
+        assert result.config_registration.id.endswith(
+            "backward_dkv_b200_tuned.sm100.d512"
+        )
+        assert result.config.num_stages == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "profile_id,query_length,expected_raw_grid,expected_q_splits,"
+        "expected_warps,expected_id"
+    ),
+    [
+        ("gemma4_e2b_text_full", 2048, 32, 3, 8, "headgrid_qs3"),
+        ("gemma4_e2b_text_full", 4288, 67, 3, 8, "headgrid_qs3"),
+        ("gemma4_e2b_text_full", 4352, 68, 2, 4, "headgrid_qs2_w4_bf16x2"),
+        ("gemma4_e2b_text_full", 4544, 71, 2, 4, "headgrid_qs2_w4_bf16x2"),
+        ("gemma4_e2b_text_full", 6720, 105, 2, 4, "headgrid_qs2_w4_bf16x2"),
+        ("gemma4_e2b_text_full", 6784, 106, 1, 8, "headgrid_qs1_bf16x2"),
+        ("gemma4_e2b_text_full", 17920, 280, 1, 8, "headgrid_qs1_bf16x2"),
+        ("gemma4_e2b_text_full", 17984, 281, 1, 8, "headgrid_qs1_bf16x2"),
+        ("gemma4_e2b_text_full", 20224, 316, 1, 8, "headgrid_qs1_bf16x2"),
+        ("gemma4_e2b_text_full", 20288, 317, 1, 8, "headgrid_qs1_bf16x2"),
+        ("gemma4_e2b_text_full", 34304, 536, 1, 8, "headgrid_qs1_bf16x2"),
+        ("gemma4_e2b_text_full", 34368, 537, 1, 4, "bkv64_grid"),
+        ("gemma4_moe_text_full", 2048, 64, 14, 8, "bf16_moe_single_qs14_w8"),
+        ("gemma4_moe_text_full", 2080, 66, 8, 8, "moe_single_qs8_w8"),
+        ("gemma4_moe_text_full", 3008, 94, 8, 8, "moe_single_qs8_w8"),
+        ("gemma4_moe_text_full", 3072, 96, 4, 8, "moe_single_qs4_w8"),
+        ("gemma4_moe_text_full", 3584, 112, 4, 8, "moe_single_qs4_w8"),
+        ("gemma4_moe_text_full", 6656, 208, 4, 4, "single_qs4"),
+    ],
+)
+def test_d512_b200_single_sequence_qsplit_ranges(
+    profile_id: str,
+    query_length: int,
+    expected_raw_grid: int,
+    expected_q_splits: int,
+    expected_warps: int,
+    expected_id: str,
+) -> None:
+    spec = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="bf16", training=True, query_length=query_length, layout="thd"
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert ConfigRegistration.grid_size(spec, 64) == expected_raw_grid
+    assert expected_id in result.config_registration.id
+    expected_block_kv = 16 if expected_id == "b200_tuned" else 64
+    expected_stages = 2 if expected_id == "b200_tuned" else 3
+    assert (result.config.block_q, result.config.block_kv) == (16, expected_block_kv)
+    assert result.config.num_stages == expected_stages
+    assert result.config.num_warps == expected_warps
+    assert result.config.q_splits == expected_q_splits
+    if expected_id in {"bkv64_grid", "b200_tuned"}:
+        assert not result.config_registration.separate_dkv_scratch
+        assert not result.config_registration.relaxed_dkv_atomics
+        assert not result.config_registration.split_gqa_heads
+        assert not result.config_registration.bf16x2_dkv_atomics
+    else:
+        assert result.config_registration.separate_dkv_scratch
+        assert result.config_registration.relaxed_dkv_atomics
+    if profile_id == "gemma4_e2b_text_full" and expected_id.startswith("headgrid"):
+        assert result.config_registration.split_gqa_heads
+        assert result.config_registration.bf16x2_dkv_atomics == (
+            expected_q_splits in {1, 2}
+        )
+
+
+@pytest.mark.parametrize(
+    "profile_id,query_length,expected_q_splits,expected_id",
+    [
+        ("gemma4_e2b_text_full", 2048, 13, "fp16_e2b_single_qs13_w8"),
+        ("gemma4_e2b_text_full", 2112, 11, "e2b_single_qs11_w8"),
+        ("gemma4_moe_text_full", 2048, 9, "fp16_moe_single_qs9_w8"),
+        ("gemma4_moe_text_full", 2240, 9, "fp16_moe_single_qs9_w8"),
+        ("gemma4_moe_text_full", 2304, 8, "moe_single_qs8_w8"),
+    ],
+)
+def test_d512_b200_fp16_qsplit_ranges(
+    profile_id: str,
+    query_length: int,
+    expected_q_splits: int,
+    expected_id: str,
+) -> None:
+    spec = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="float16", training=True, query_length=query_length, layout="thd"
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert expected_id in result.config_registration.id
+    assert result.config.q_splits == expected_q_splits
+    assert result.config_registration.separate_dkv_scratch
+    assert result.config_registration.relaxed_dkv_atomics
+
+
+@pytest.mark.parametrize(
+    "profile_id,query_length,batch_size,expected_id",
+    [
+        ("gemma4_moe_text_full", 4096, 1, "single_qs4"),
+        ("gemma4_moe_text_full", 2048, 2, "bkv64_grid"),
+        ("gemma4_e2b_text_full", 4096, 2, "bkv64_grid"),
+    ],
+)
+def test_d512_b200_moe_w8_gate_preserves_other_shapes(
+    profile_id: str, query_length: int, batch_size: int, expected_id: str
+) -> None:
+    spec = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="bf16",
+        training=True,
+        query_length=query_length,
+        batch_size=batch_size,
+        layout="thd",
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert expected_id in result.config_registration.id
+    assert result.config.num_warps == 4
+
+
+def test_d512_b200_moe_w8_gate_excludes_sliding_attention() -> None:
+    spec = AttentionSpec(
+        q_heads=16,
+        kv_heads=2,
+        head_dim=512,
+        dtype="bf16",
+        causal=True,
+        window_size=1024,
+        layout="thd",
+        training=True,
+        batch_size=1,
+        query_length=2048,
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert "single_qs4" in result.config_registration.id
+    assert "moe_single_qs4_w8" not in result.config_registration.id
+    assert result.config.num_warps == 4
+
+
+@pytest.mark.parametrize(
+    "profile_id,query_length,expected_raw_grid,expected_id,expected_block_kv",
+    [
+        ("gemma4_e2b_text_full", 2048, 32, "forward_b200_e2b_bkv64", 64),
+        ("gemma4_e2b_text_full", 15360, 240, "forward_b200_e2b_bkv64", 64),
+        ("gemma4_e2b_text_full", 16384, 256, "forward.sm100.d512", 32),
+        ("gemma4_moe_text_full", 2048, 64, "forward_b200_moe_bkv64", 64),
+        ("gemma4_moe_text_full", 3072, 96, "forward_b200_moe_bkv64", 64),
+        ("gemma4_moe_text_full", 3584, 112, "forward.sm100.d512", 32),
+    ],
+)
+def test_d512_b200_forward_bkv64_ranges(
+    profile_id: str,
+    query_length: int,
+    expected_raw_grid: int,
+    expected_id: str,
+    expected_block_kv: int,
+) -> None:
+    spec = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="bf16", training=True, query_length=query_length, layout="thd"
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="forward")
+    assert ConfigRegistration.grid_size(spec, 64) == expected_raw_grid
+    assert expected_id in result.config_registration.id
+    assert (result.config.block_q, result.config.block_kv) == (32, expected_block_kv)
+    assert (result.config.num_warps, result.config.num_stages) == (4, 2)
+
+
+@pytest.mark.parametrize(
+    "profile_id,batch_size,window_size",
+    [
+        ("gemma4_e2b_text_full", 2, 0),
+        ("gemma4_e2b_text_full", 1, 1024),
+        ("gemma4_moe_text_full", 2, 0),
+    ],
+)
+def test_d512_b200_forward_bkv64_excludes_packed_and_sliding(
+    profile_id: str, batch_size: int, window_size: int
+) -> None:
+    base = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="bf16", training=True, query_length=2048, layout="thd"
+    )
+    spec = replace(base, batch_size=batch_size, window_size=window_size)
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="forward")
+    assert result.config_registration.id.endswith("forward.sm100.d512")
+    assert result.config.block_kv == 32
+
+
+def test_d512_b200_e2b_w8_gate_excludes_sliding_attention() -> None:
+    spec = AttentionSpec(
+        q_heads=8,
+        kv_heads=1,
+        head_dim=512,
+        dtype="bf16",
+        causal=True,
+        window_size=1024,
+        layout="thd",
+        training=True,
+        batch_size=1,
+        query_length=4096,
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert "single_qs4" in result.config_registration.id
+    assert "e2b_single_qs8_w8" not in result.config_registration.id
+    assert result.config.num_warps == 4
+
+
+@pytest.mark.parametrize(
+    "profile_id,query_length,batch_size,expected_id,expected_q_splits",
+    [
+        ("gemma4_moe_text_full", 1024, 1, "b200_tuned", 1),
+        ("gemma4_e2b_text_full", 2048, 4, "bkv64_grid", 1),
+        ("gemma4_e2b_text_full", 34368, 1, "bkv64_grid", 1),
+        ("gemma4_e2b_text_full", 38400, 1, "bkv64_grid", 1),
+    ],
+)
+def test_d512_b200_qsplit_gate_preserves_fallbacks(
+    profile_id: str,
+    query_length: int,
+    batch_size: int,
+    expected_id: str,
+    expected_q_splits: int,
+) -> None:
+    spec = DEFAULT_MODEL_PROFILES.get(profile_id).make_spec(
+        dtype="bf16",
+        training=True,
+        query_length=query_length,
+        batch_size=batch_size,
+        layout="thd",
+    )
+    result = DEFAULT_REGISTRY.resolve(spec, SM100_RUNTIME, role="backward_dkv")
+    assert expected_id in result.config_registration.id
+    assert result.config.q_splits == expected_q_splits
+    assert not result.config_registration.separate_dkv_scratch
+    assert not result.config_registration.relaxed_dkv_atomics
+
+
 def test_d512_b200_tuning_keeps_unknown_sm100_safe_base() -> None:
     spec = DEFAULT_MODEL_PROFILES.get("gemma4_e2b_text_full").make_spec(
         dtype="bf16", training=True, query_length=129, layout="thd"
@@ -272,6 +544,8 @@ def test_d512_b200_tuning_keeps_unknown_sm100_safe_base() -> None:
     assert result.config_registration.id.endswith("backward_dkv.sm100.d512")
     assert (result.config.block_q, result.config.block_kv) == (64, 16)
     assert result.config.q_splits == 8
+    assert not result.config_registration.separate_dkv_scratch
+    assert not result.config_registration.relaxed_dkv_atomics
 
 
 @pytest.mark.parametrize(

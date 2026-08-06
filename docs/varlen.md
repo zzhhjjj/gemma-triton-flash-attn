@@ -66,10 +66,10 @@ Samples pack contiguously along the token axis of `q`, `k`, `v`.
 
 ## GQA
 
-Pack-GQA design preserved from the batched kernel: the dK/dV backward runs
-one program per KV block, unrolls all `GQA_RATIO` Q heads internally, and
-writes a single accumulator per KV tile — no expand buffer, no atomic when
-`Q_SPLITS=1`, no reduce kernel.
+基础 Pack-GQA dK/dV 每个 KV block 启动一个 program，并在内部展开
+`GQA_RATIO` 个 Q head；B200 部分已验证区间会把 GQA head 映射进 grid，
+以 atomic 汇总换取更高并行度。两种路径都不需要 expand buffer 或独立
+reduce kernel。
 
 ## SWA interaction
 
@@ -87,12 +87,13 @@ of truth. Packed beats `(B, H_Q, max_seqlen_q)` on skewed distributions
 
 ## Atomic safety across samples
 
-When `Q_SPLITS > 1`, dKV programs write via `atomic_add` to a pre-zeroed
-packed dK/dV buffer. Because `kv_global = cu_seqlens_k[b] + kv_local_idx`
+When `Q_SPLITS > 1` or GQA heads are split into the launch grid, dKV programs
+write via atomics to a pre-zeroed packed dK/dV buffer. Because
+`kv_global = cu_seqlens_k[b] + kv_local_idx`
 is strictly monotone across samples (cu_seqlens is monotone), programs
 from different samples **never** write to the same packed row. The only
-atomic contention is within a single sample's (kv_h, Q_SPLITS) cohort —
-identical to the batched kernel.
+atomic contention is within a single sample's `(kv_h, q_split, GQA head)`
+cohort。
 
 ## 当前测试
 
@@ -177,7 +178,14 @@ compile-safe 口径，不表示这些历史 tuning 已完成新软件栈复认�
 - kernel 本身不支持 image-group OR-mask；
 - HF integration 已提供 `triton_gqa_varlen_attention`、注册函数和 Ulysses varlen adapter，不再是“完全没有 HF hook”；
 - `sm90` 保留 H100/H200 compile-safe base；H200 尚无独立 tuned override；
-- `sm100` 保留安全 base，B200 varlen D512 dKV 使用已验证 product override；
+- `sm100` 保留安全 base；B200 varlen D512 dKV 使用已验证 product override，
+  单序列 qsplit 路径启用 relaxed atomic、独立 dK/dV scratch 与顺序转换：
+  E2B BF16 full batch1 的 raw32–67 使用 head-grid q3+FP32 scratch，
+  raw68–105 使用 q2/w4+BF16x2，raw106–536 使用 q1+BF16x2，raw537+回到BKV64；
+  MoE BF16 2K 使用 w8/q14，其他 raw64–95 使用 w8/q8、96–127 使用 w8/q4；
+  FP16 scratch 与输出同dtype，保留E2B raw32 q13与MoE raw64–71 q9；
+- B200 D512 full forward 的 BKV64 只用于 batch1：E2B raw32–240、MoE
+  raw64–96；packed、sliding、长序列和其他硬件保持 BKV32 base；
 - 各硬件性能结论必须在对应实机重新采集，不能复用旧 H200 或 B200 数字。
 
 ## Source
