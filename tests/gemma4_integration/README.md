@@ -85,13 +85,13 @@ python test_memory.py
 
 ## How it works
 
-transformers 5.5.4 exposes a pluggable `ALL_ATTENTION_FUNCTIONS` registry.
-The test registers a `triton_gqa` entry pointing to our Triton kernel, then
-sets `model.config._attn_implementation = "triton_gqa"`. Every attention
-layer in the model routes through our kernel.
+transformers 5.5.4 exposes the public `AttentionInterface` registry. The test
+registers a `triton_gqa` entry pointing to our Triton kernel, then sets
+`model.config._attn_implementation = "triton_gqa"`. Every attention layer in
+the model routes through our kernel.
 
 ```python
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers import AttentionInterface
 from gemma_triton_flash_attn import flash_attn_gqa_train
 
 def triton_gqa_attention(module, query, key, value, attention_mask,
@@ -99,7 +99,7 @@ def triton_gqa_attention(module, query, key, value, attention_mask,
     # Bake scaling into q, call kernel, transpose output
     ...
 
-ALL_ATTENTION_FUNCTIONS["triton_gqa"] = triton_gqa_attention
+AttentionInterface.register("triton_gqa", triton_gqa_attention)
 model.config._attn_implementation = "triton_gqa"
 ```
 

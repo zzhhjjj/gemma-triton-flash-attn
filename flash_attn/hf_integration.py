@@ -1,8 +1,8 @@
 """HuggingFace transformers integration.
 
 Registers the Triton GQA kernel as a pluggable attention implementation that
-any transformers model using the `ALL_ATTENTION_FUNCTIONS` registry can opt
-into via `model.config._attn_implementation = "triton_gqa"`.
+any Transformers model using `AttentionInterface` can opt into via
+`model.config._attn_implementation = "triton_gqa"`.
 
 Tested on transformers>=5.5 with Gemma4-style models (sliding + full causal
 interleaved GQA).
@@ -20,10 +20,11 @@ Typical usage:
 Every attention layer now routes through the Triton kernel. No model code
 changes required.
 """
+
 from __future__ import annotations
 
 import contextvars
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 
@@ -51,9 +52,10 @@ from .attention import flash_attn_gqa_train
 # Full-attention layers ignore them (matches upstream).
 # =====================================================================
 
+
 class _ImageGroupState(NamedTuple):
-    group_ids: torch.Tensor      # (B, N) int32; -1 = non-vision token
-    group_lo: torch.Tensor       # (B, N) int32; first KV idx in same group (or self)
+    group_ids: torch.Tensor  # (B, N) int32; -1 = non-vision token
+    group_lo: torch.Tensor  # (B, N) int32; first KV idx in same group (or self)
     group_hi_excl: torch.Tensor  # (B, N) int32; last KV idx+1 in same group (or self+1)
 
 
@@ -109,9 +111,9 @@ def _compute_image_group_state(mm_token_type_ids: torch.Tensor) -> _ImageGroupSt
 
 def triton_gqa_attention(
     module,
-    query: torch.Tensor,            # (B, H_Q, N, D)
-    key: torch.Tensor,              # (B, H_KV, N, D)
-    value: torch.Tensor,            # (B, H_KV, N, D)
+    query: torch.Tensor,  # (B, H_Q, N, D)
+    key: torch.Tensor,  # (B, H_KV, N, D)
+    value: torch.Tensor,  # (B, H_KV, N, D)
     attention_mask: torch.Tensor | None,
     dropout: float = 0.0,
     scaling: float | None = None,
@@ -132,7 +134,7 @@ def triton_gqa_attention(
     # Reconcile scaling. Our kernel bakes in 1/sqrt(D) internally. If the module
     # passes a different `scaling` (e.g., Gemma4 passes 1.0 because scaling is
     # folded into q_norm), pre-multiply q to cancel the kernel's internal scale.
-    scale = scaling if scaling is not None else module.head_dim ** -0.5
+    scale = scaling if scaling is not None else module.head_dim**-0.5
     default_scale = query.shape[-1] ** -0.5
     if scale != default_scale:
         query = query * (scale / default_scale)
@@ -157,9 +159,15 @@ def triton_gqa_attention(
     # Defensive guard: if the caller passed a 4D / BlockMask but no group
     # state is in context, image bidirectional info would be silently
     # dropped — fail loudly so the user installs the patch.
-    if (group_state is None) and (attention_mask is not None) and slide > 0 and is_causal:
+    if (
+        (group_state is None)
+        and (attention_mask is not None)
+        and slide > 0
+        and is_causal
+    ):
         is_4d = isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
         from torch.nn.attention.flex_attention import BlockMask
+
         is_blockmask = isinstance(attention_mask, BlockMask)
         if is_4d or is_blockmask:
             raise RuntimeError(
@@ -190,8 +198,11 @@ def triton_gqa_attention(
     # stream — silently producing NaN output. Wrap the launch in a device ctx.
     with torch.cuda.device(query.device):
         out = flash_attn_gqa_train(
-            query, key, value,
-            causal=is_causal, slide_size=slide,
+            query,
+            key,
+            value,
+            causal=is_causal,
+            slide_size=slide,
             group_ids=group_args[0],
             group_lo=group_args[1],
             group_hi_excl=group_args[2],
@@ -201,15 +212,130 @@ def triton_gqa_attention(
 
 
 def register_triton_attention(name: str = "triton_gqa") -> None:
-    """Register the Triton GQA kernel under the given name in transformers'
-    `ALL_ATTENTION_FUNCTIONS` registry.
+    """Register the Triton GQA kernel through Transformers' public attention API.
 
     After calling this, set `model.config._attn_implementation = name` (and
     `model.config.text_config._attn_implementation = name` for multimodal
     configs) to route every attention layer through the Triton kernel.
     """
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    ALL_ATTENTION_FUNCTIONS[name] = triton_gqa_attention
+    _register_attention(name, triton_gqa_attention)
+
+
+def _register_attention(name: str, attention_fn: Callable) -> None:
+    """Register an attention callable through Transformers' public API."""
+    if not name or name == "eager":
+        raise ValueError(
+            "A custom attention implementation needs a non-empty name other than 'eager'."
+        )
+
+    try:
+        from transformers import AttentionInterface
+    except ImportError as exc:
+        raise ImportError(
+            "gemma-triton-flash-attn's Hugging Face integration requires transformers>=5.5.0."
+        ) from exc
+
+    AttentionInterface.register(name, attention_fn)
+
+
+def _build_ulysses_attention(
+    cp_group, attention_fn: Callable = triton_gqa_attention
+) -> Callable:
+    """Build a Transformers attention adapter with Ulysses all-to-all communication.
+
+    This factory is intentionally separate from registration so its distributed
+    layout and autograd behavior can be tested with a small PyTorch attention
+    reference on CPU-only CI.
+    """
+    import os
+
+    import torch.distributed as dist
+
+    from .cp_comm import SeqAllToAll4D
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "Ulysses attention must be registered after torch.distributed is initialized."
+        )
+
+    cp_size = dist.get_world_size(cp_group)
+    if cp_size < 2:
+        raise ValueError(
+            "Ulysses attention requires a context-parallel group with at least two ranks."
+        )
+
+    seen = 0
+
+    def ulysses_attention(module, query, key, value, attention_mask=None, **kwargs):
+        nonlocal seen
+        seen += 1
+
+        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+            raise ValueError(
+                "Ulysses attention expects Q, K, and V in (batch, heads, sequence, dim) layout."
+            )
+        if key.shape != value.shape:
+            raise ValueError(
+                f"K and V must have the same shape, got {key.shape} and {value.shape}."
+            )
+        if query.shape[0] != key.shape[0] or query.shape[2:] != key.shape[2:]:
+            raise ValueError(
+                f"Q and K/V batch, sequence, and head dimensions must match: {query.shape}, {key.shape}."
+            )
+        if attention_mask is not None:
+            raise NotImplementedError(
+                "The dense Ulysses adapter currently supports kernel-owned causal/sliding masks only. "
+                "Use the varlen adapter for packed samples."
+            )
+
+        num_query_heads = query.shape[1]
+        num_kv_heads = key.shape[1]
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_query_heads ({num_query_heads}) must be divisible by num_kv_heads ({num_kv_heads})."
+            )
+
+        # When a Gemma global-attention layer has fewer KV heads than CP ranks,
+        # expand K/V to MHA before scattering. This avoids empty all-to-all chunks.
+        if num_kv_heads < cp_size:
+            kv_repeat = num_query_heads // num_kv_heads
+            key = key.repeat_interleave(kv_repeat, dim=1)
+            value = value.repeat_interleave(kv_repeat, dim=1)
+            num_kv_heads = key.shape[1]
+
+        if num_query_heads % cp_size != 0 or num_kv_heads % cp_size != 0:
+            raise ValueError(
+                "Ulysses requires the post-replication Q and KV head counts to be divisible by "
+                f"cp_size={cp_size}, got Hq={num_query_heads} and Hkv={num_kv_heads}."
+            )
+
+        if seen <= 6 and os.environ.get("CP_DEBUG", "0") == "1":
+            if dist.get_rank() == 0:
+                print(
+                    f"[triton_gqa][cp] call={seen} q={tuple(query.shape)} "
+                    f"k={tuple(key.shape)} sliding_window={kwargs.get('sliding_window')}",
+                    flush=True,
+                )
+
+        # (B, H, N_local, D) -> (B, H/cp, N_full, D)
+        query = SeqAllToAll4D.apply(cp_group, query, 1, 2)
+        key = SeqAllToAll4D.apply(cp_group, key, 1, 2)
+        value = SeqAllToAll4D.apply(cp_group, value, 1, 2)
+
+        result = attention_fn(module, query, key, value, attention_mask=None, **kwargs)
+        output = result[0] if isinstance(result, tuple) else result
+        if output.ndim != 4:
+            raise ValueError(
+                f"The wrapped attention must return a 4D output, got shape {output.shape}."
+            )
+
+        # Transformers attention functions return (B, N_full, H/cp, D).
+        output = output.transpose(1, 2).contiguous()
+        output = SeqAllToAll4D.apply(cp_group, output, 2, 1)
+        output = output.transpose(1, 2).contiguous()
+        return output, None
+
+    return ulysses_attention
 
 
 def register_triton_attention_ulysses(
@@ -221,54 +347,7 @@ def register_triton_attention_ulysses(
     gathers seq dim across `cp_group`, runs local attention on the full seq
     with a head-shard, then inverts the all-to-all.
     """
-    import os as _os
-
-    import torch.distributed as _dist
-
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-    from .cp_comm import SeqAllToAll4D
-
-    _seen = {"n": 0}
-
-    def _ulysses_wrapped(module, query, key, value, attention_mask=None, **kwargs):
-        _seen["n"] += 1
-        n = _seen["n"]
-        if n <= 6 and _os.environ.get("CP_DEBUG", "0") == "1":
-            if not _dist.is_initialized() or _dist.get_rank() == 0:
-                print(
-                    f"[CP_DBG][rank0] ulysses_wrapped #{n} entry "
-                    f"q={tuple(query.shape)} k={tuple(key.shape)} v={tuple(value.shape)} "
-                    f"slide={kwargs.get('sliding_window', None)}",
-                    flush=True,
-                )
-        # GQA + Ulysses: when num_kv_heads < cp_size, replicate K/V to match
-        # Q heads before the all-to-all (avoids empty NCCL chunks).
-        cp_size = _dist.get_world_size(cp_group)
-        h_q = query.shape[1]
-        h_kv = key.shape[1]
-        if h_kv < cp_size:
-            kv_repeat = h_q // h_kv
-            key = key.repeat_interleave(kv_repeat, dim=1)
-            value = value.repeat_interleave(kv_repeat, dim=1)
-            if n <= 6 and _os.environ.get("CP_DEBUG", "0") == "1":
-                if not _dist.is_initialized() or _dist.get_rank() == 0:
-                    print(
-                        f"[CP_DBG][rank0] ulysses_wrapped #{n} KV-replicated "
-                        f"by {kv_repeat}x → k={tuple(key.shape)}",
-                        flush=True,
-                    )
-        # (B, H, N_local, D) -> (B, H/cp, N_full, D)
-        q = SeqAllToAll4D.apply(cp_group, query, 1, 2)
-        k = SeqAllToAll4D.apply(cp_group, key, 1, 2)
-        v = SeqAllToAll4D.apply(cp_group, value, 1, 2)
-        out, _ = triton_gqa_attention(module, q, k, v, attention_mask=None, **kwargs)
-        out = out.transpose(1, 2).contiguous()
-        out = SeqAllToAll4D.apply(cp_group, out, 2, 1)
-        out = out.transpose(1, 2).contiguous()
-        return out, None
-
-    ALL_ATTENTION_FUNCTIONS[name] = _ulysses_wrapped
+    _register_attention(name, _build_ulysses_attention(cp_group))
 
 
 # =====================================================================
@@ -302,6 +381,7 @@ def cu_seqlens_from_2d_indices(indices_2d):
         cu_seqlens: int32 (num_samples+1,), total_valid: int
     """
     import torch
+
     indices = indices_2d.squeeze(0) if indices_2d.dim() == 2 else indices_2d
     mask = indices != 0
     total_valid = int(mask.sum().item())
@@ -312,7 +392,9 @@ def cu_seqlens_from_2d_indices(indices_2d):
     boundaries = [0]
     for uid in unique_ids:
         boundaries.append(boundaries[-1] + int((valid_indices == uid).sum().item()))
-    return torch.tensor(boundaries, dtype=torch.int32, device=indices.device), total_valid
+    return torch.tensor(
+        boundaries, dtype=torch.int32, device=indices.device
+    ), total_valid
 
 
 def triton_gqa_varlen_attention(
@@ -340,18 +422,26 @@ def triton_gqa_varlen_attention(
     if state is None and attention_mask is not None and attention_mask.dim() == 2:
         cu, total = cu_seqlens_from_2d_indices(attention_mask)
         if total > 0:
-            max_sl = max(int(cu[i+1] - cu[i]) for i in range(cu.numel() - 1))
+            max_sl = max(int(cu[i + 1] - cu[i]) for i in range(cu.numel() - 1))
             state = (cu, max_sl)
 
     if state is None:
-        return triton_gqa_attention(module, query, key, value, attention_mask,
-                                    dropout=dropout, scaling=scaling,
-                                    softcap=softcap, sliding_window=sliding_window,
-                                    **kwargs)
+        return triton_gqa_attention(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            softcap=softcap,
+            sliding_window=sliding_window,
+            **kwargs,
+        )
 
     cu_seqlens, max_seqlen = state
 
-    scale = scaling if scaling is not None else module.head_dim ** -0.5
+    scale = scaling if scaling is not None else module.head_dim**-0.5
     default_scale = query.shape[-1] ** -0.5
     if scale != default_scale:
         query = query * (scale / default_scale)
@@ -370,8 +460,13 @@ def triton_gqa_varlen_attention(
     # cu_seqlens already includes dummy padding sample (set by trainer)
     with torch.cuda.device(query.device):
         out_packed = flash_attn_gqa_varlen(
-            q_packed, k_packed, v_packed,
-            cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+            q_packed,
+            k_packed,
+            v_packed,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
             causal=getattr(module, "is_causal", True),
             window_size=slide,
         )
@@ -383,8 +478,7 @@ def triton_gqa_varlen_attention(
 
 def register_triton_attention_varlen(name: str = "triton_gqa_varlen") -> None:
     """Register the varlen adapter."""
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    ALL_ATTENTION_FUNCTIONS[name] = triton_gqa_varlen_attention
+    _register_attention(name, triton_gqa_varlen_attention)
 
 
 def register_triton_attention_varlen_ulysses(
@@ -395,23 +489,32 @@ def register_triton_attention_varlen_ulysses(
     Wraps each attention call with all-to-all (scatter heads, gather tokens),
     runs varlen attention on the reassembled full sequence, then inverses.
     """
-    import os as _os
     import torch
     import torch.distributed as _dist
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from .cp_comm import SeqAllToAll4D
     from .attention import flash_attn_gqa_varlen
 
-    _seen = {"n": 0}
-
-    def _varlen_ulysses_wrapped(module, query, key, value, attention_mask=None, **kwargs):
-        _seen["n"] += 1
-        n = _seen["n"]
+    def _varlen_ulysses_wrapped(
+        module, query, key, value, attention_mask=None, **kwargs
+    ):
         cp_size = _dist.get_world_size(cp_group)
+
+        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
+            raise ValueError(
+                "The varlen Ulysses adapter requires batch_size=1 packed input."
+            )
+        if kwargs.get("softcap") is not None:
+            raise NotImplementedError(
+                "triton_gqa_varlen_ulysses does not support softcap"
+            )
+        if kwargs.get("dropout", 0.0) != 0.0:
+            raise NotImplementedError(
+                "triton_gqa_varlen_ulysses does not support attention dropout"
+            )
 
         scale = kwargs.get("scaling", None)
         if scale is None:
-            scale = module.head_dim ** -0.5
+            scale = module.head_dim**-0.5
         default_scale = query.shape[-1] ** -0.5
         if scale != default_scale:
             query = query * (scale / default_scale)
@@ -423,11 +526,21 @@ def register_triton_attention_varlen_ulysses(
         B, H_Q, N_local, D = query.shape
         H_KV = key.shape[1]
 
+        if H_Q % H_KV != 0:
+            raise ValueError(f"H_Q ({H_Q}) must be divisible by H_KV ({H_KV}).")
+
         # KV replication for GQA when H_KV < cp_size
         if H_KV < cp_size:
             kv_rep = H_Q // H_KV
             key = key.repeat_interleave(kv_rep, dim=1)
             value = value.repeat_interleave(kv_rep, dim=1)
+            H_KV = key.shape[1]
+
+        if H_Q % cp_size != 0 or H_KV % cp_size != 0:
+            raise ValueError(
+                f"Post-replication head counts must be divisible by cp_size={cp_size}, "
+                f"got H_Q={H_Q}, H_KV={H_KV}."
+            )
 
         # Reshape to packed: (B=1, H, N_local, D) -> (N_local, H, D)
         q_local = query.squeeze(0).permute(1, 0, 2).contiguous()
@@ -445,14 +558,22 @@ def register_triton_attention_varlen_ulysses(
         if state is not None:
             cu_seqlens, max_seqlen = state
         else:
-            cu_seqlens = torch.tensor([0, N_full], dtype=torch.int32, device=q_full.device)
+            cu_seqlens = torch.tensor(
+                [0, N_full], dtype=torch.int32, device=q_full.device
+            )
             max_seqlen = N_full
 
         with torch.cuda.device(query.device):
             out_full = flash_attn_gqa_varlen(
-                q_full.contiguous(), k_full.contiguous(), v_full.contiguous(),
-                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                causal=is_causal, window_size=slide,
+                q_full.contiguous(),
+                k_full.contiguous(),
+                v_full.contiguous(),
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=is_causal,
+                window_size=slide,
             )
 
         # Inverse all-to-all: scatter tokens (dim=0), gather heads (dim=1)
@@ -463,7 +584,7 @@ def register_triton_attention_varlen_ulysses(
         out = out.transpose(1, 2).contiguous()
         return out, None
 
-    ALL_ATTENTION_FUNCTIONS[name] = _varlen_ulysses_wrapped
+    _register_attention(name, _varlen_ulysses_wrapped)
 
 
 def patch_transformers_5_5_4_flash_attn_key() -> None:
@@ -474,6 +595,7 @@ def patch_transformers_5_5_4_flash_attn_key() -> None:
     Safe to call multiple times (uses `setdefault`).
     """
     from transformers.utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING
+
     PACKAGE_DISTRIBUTION_MAPPING.setdefault("flash_attn", ["flash-attn"])
 
 
@@ -489,6 +611,7 @@ class _SharedKVStatesHolder:
     Subscript ops `[idx]` are routed to an internal dict to match the original
     `shared_kv_states: dict[int, tuple[K, V]]` contract used by Gemma-4 code.
     """
+
     __slots__ = ("_d",)
 
     def __init__(self):
@@ -549,19 +672,29 @@ def patch_gemma4_shared_kv_states_for_fsdp2() -> None:
         **kwargs,
     ):
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
         if input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids)
         if self.hidden_size_per_layer_input:
             if per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
-            per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+            per_layer_inputs = self.project_per_layer_inputs(
+                inputs_embeds, per_layer_inputs
+            )
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
         if position_ids is None:
             import torch
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
+            position_ids = (
+                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                + past_seen_tokens
+            )
             position_ids = position_ids.unsqueeze(0)
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
@@ -578,14 +711,18 @@ def patch_gemma4_shared_kv_states_for_fsdp2() -> None:
         hidden_states = inputs_embeds
         position_embeddings = {}
         for layer_type in self.unique_layer_types:
-            position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
+            position_embeddings[layer_type] = self.rotary_emb(
+                hidden_states, position_ids, layer_type
+            )
 
         # THE FIX: use pytree-opaque holder so FSDP2's per-layer flatten/unflatten
         # preserves the dict-like state across decoder-layer boundaries.
         shared_kv_states = _SharedKVStatesHolder()
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            per_layer_input = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            per_layer_input = (
+                per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            )
             hidden_states = decoder_layer(
                 hidden_states,
                 per_layer_input,
@@ -633,7 +770,9 @@ def patch_gemma4_image_group_ids_for_kernel() -> None:
         # (b) we actually have mm_token_type_ids (the prefill / training case
         # — incremental decode doesn't carry them).
         text_cfg = self.config.get_text_config()
-        wants_groups = getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
+        wants_groups = (
+            getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
+        )
         mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
 
         token = None

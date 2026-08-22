@@ -6,14 +6,26 @@ All exports live in `gemma_triton_flash_attn` (package name: `gemma-triton-flash
 
 ### `register_triton_attention(name: str = "triton_gqa") -> None`
 
-Register the Triton kernel in transformers' `ALL_ATTENTION_FUNCTIONS` under
-the given name. Safe to call multiple times (idempotent).
+Register the Triton kernel with transformers' public `AttentionInterface`
+under the given name. Safe to call multiple times.
 
 ```python
 from gemma_triton_flash_attn import register_triton_attention
 register_triton_attention()                 # "triton_gqa" (default)
 register_triton_attention(name="my_attn")   # or pick your own key
 ```
+
+### `register_triton_attention_ulysses(cp_group, name: str = "triton_gqa_ulysses") -> None`
+
+Register the dense attention adapter with differentiable Ulysses all-to-all.
+Call it after `torch.distributed` is initialized. Q heads and post-replication
+KV heads must be divisible by the CP group size.
+
+### `register_triton_attention_varlen_ulysses(cp_group, name: str = "triton_gqa_varlen_ulysses") -> None`
+
+Register the packed, batch-size-one varlen adapter with Ulysses all-to-all.
+Packed sequence offsets must be installed with `set_varlen_cu_seqlens` before
+the model forward.
 
 ### `triton_gqa_attention(module, q, k, v, attention_mask, *, scaling, sliding_window, dropout=0.0, softcap=0.0, **kwargs) -> (out, None)`
 
@@ -71,7 +83,7 @@ v: (B, N_KV_HEADS, N, D)
 The following raise `NotImplementedError` (adapter) or simply aren't
 implemented (direct kernel):
 
-- Variable-length sequences / padding mask
+- Arbitrary additive masks on the dense adapter
 - ALiBi or positional bias injection
 - `softcap ≠ 0`
 - `dropout > 0`

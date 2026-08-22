@@ -1,5 +1,27 @@
 # Testing
 
+## Distributed context parallelism
+
+The CPU test launches two Gloo ranks and compares the Ulysses output and
+dQ/dK/dV against full-sequence PyTorch attention. It covers both Gemma 4
+attention dimensions and the `H_KV < cp_size` replication path:
+
+```bash
+pytest -q tests/test_cp_distributed.py
+```
+
+The CUDA test launches the real Triton kernels under NCCL. It supports two,
+four, or eight local GPUs:
+
+```bash
+torchrun --standalone --nproc-per-node=2 tests/test_cp_cuda.py
+torchrun --standalone --nproc-per-node=4 tests/test_cp_cuda.py
+torchrun --standalone --nproc-per-node=8 tests/test_cp_cuda.py
+```
+
+For multi-node validation, use the cluster's normal `torchrun` rendezvous
+arguments and execute the same script on every node.
+
 ## Adapter unit test — `tests/gemma4_integration/test_adapter.py`
 
 Exercises the registered `triton_gqa` adapter directly against an SDPA
