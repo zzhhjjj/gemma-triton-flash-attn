@@ -193,10 +193,34 @@ if hasattr(model.config, "text_config"):                      # 3. opt in nested
 out = model(input_ids)
 ```
 
+Registration uses Transformers' public `AttentionInterface.register()` API.
+The kernel owns causal and sliding-window masking; packed input uses the
+separate varlen adapter described below.
+
 **transformers 5.5.4 users**: call
 `patch_transformers_5_5_4_flash_attn_key()` once before any config load to
 work around the upstream `KeyError: 'flash_attn'` bug
 ([details](docs/integration.md#transformers-554-keyerror-workaround)).
+
+## Ulysses context parallelism
+
+The package includes a Ulysses adapter that scatters attention heads and
+gathers sequence shards before running the Triton kernel. Register it only
+after `torch.distributed` and the context-parallel process group exist:
+
+```python
+from gemma_triton_flash_attn import register_triton_attention_ulysses
+
+register_triton_attention_ulysses(cp_group, name="triton_gqa_ulysses")
+model.set_attn_implementation("triton_gqa_ulysses")
+```
+
+The dense adapter supports causal/full and causal/sliding attention. Q heads
+must be divisible by the CP size. When a Gemma 4 global layer has fewer KV
+heads than CP ranks, K/V are expanded before the all-to-all and gradients are
+reduced back through `repeat_interleave` autograd. Packed batches should use
+`register_triton_attention_varlen_ulysses`; dense CP deliberately rejects an
+explicit attention mask instead of silently dropping it.
 
 ## Variable-length (packed) sequences
 
@@ -255,12 +279,20 @@ typically 1.3×–4.5× faster end-to-end on H100.
 ## Installation
 
 ```bash
-git clone <repo>
-cd kernel
-pip install -e .
+pip install "gemma-triton-flash-attn[hf]"
 ```
 
-Requires: `torch>=2.0`, `triton>=3.0`, CUDA GPU (tested on H100).
+To install from source:
+
+```bash
+git clone https://github.com/zzhhjjj/gemma-triton-flash-attn.git
+cd gemma-triton-flash-attn
+pip install -e ".[hf]"
+```
+
+Requires: Python 3.10+, `torch>=2.0`, `triton>=3.0`, and a CUDA GPU for
+kernel execution (tested on H100/H200). The CPU/Gloo CP test exercises the
+distributed layout and autograd wrapper without launching Triton.
 
 For the integration tests (real Gemma-4-E2B download):
 
@@ -271,7 +303,14 @@ pip install -r requirements.txt          # transformers 5.5.4, accelerate, etc.
 ## Running the tests
 
 ```bash
-# 1) Adapter unit test — 24 cases (GQA × SWA × D), seconds
+# Public registration + two-rank Gloo Ulysses forward/backward
+pytest -q tests/test_cp_distributed.py
+
+# Actual Triton + NCCL Ulysses at D=256 and D=512
+torchrun --standalone --nproc-per-node=2 tests/test_cp_cuda.py
+# Repeat with 4 or 8 ranks to cover H_KV < CP replication.
+
+# Adapter unit test — 24 cases (GQA × SWA × D), seconds
 python tests/gemma4_integration/test_adapter.py
 
 # 2) Real Gemma-4-E2B end-to-end — downloads 5 GB on first run

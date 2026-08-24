@@ -6,17 +6,41 @@ transformers 5.5.4.
 
 ## Registry mechanism
 
-transformers ≥ 5.5 exposes a pluggable dict, `ALL_ATTENTION_FUNCTIONS`, keyed
-by implementation name (`"sdpa"`, `"eager"`, `"flash_attention_2"`, …). Every
-attention layer looks up its kernel by
-`ALL_ATTENTION_FUNCTIONS[config._attn_implementation]`. We register one extra
-entry, `"triton_gqa"`, pointing at the adapter.
+transformers ≥ 5.5 exposes the public `AttentionInterface` registry, keyed by
+implementation name (`"sdpa"`, `"eager"`, `"flash_attention_2"`, …). Every
+attention layer resolves its kernel through that interface. We call
+`AttentionInterface.register()` to add a `"triton_gqa"` entry pointing at the
+adapter; no private registry mutation is required.
 
 ```python
 from gemma_triton_flash_attn import register_triton_attention
 register_triton_attention()                # default name: "triton_gqa"
 register_triton_attention(name="my_attn")  # or pick your own
 ```
+
+The custom implementation intentionally does not register an
+`AttentionMaskInterface` formatter: this kernel creates causal and
+sliding-window masks internally. Dense Ulysses rejects explicit masks, and
+packed samples use the varlen registration, so unsupported masks fail loudly
+instead of being ignored.
+
+## Ulysses context parallelism
+
+The Ulysses registration wraps the same adapter with three differentiable
+all-to-all operations before attention and the inverse operation afterward:
+
+```python
+from gemma_triton_flash_attn import register_triton_attention_ulysses
+
+register_triton_attention_ulysses(cp_group, name="triton_gqa_ulysses")
+model.set_attn_implementation("triton_gqa_ulysses")
+```
+
+Input Q/K/V layout is `(B, H, N_local, D)`. Each rank receives
+`(B, H/cp, N_full, D)` for local attention. Gemma 4 global layers can have
+fewer KV heads than CP ranks; in that case K/V are expanded to the Q-head
+count before communication. The inverse all-to-all restores
+`(B, N_local, H, D)` for Transformers.
 
 ## What the adapter does
 

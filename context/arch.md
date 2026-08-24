@@ -105,7 +105,7 @@ Stride 参数完全通用，支持非 contiguous tensor（但 contiguous 最快�
 
 | 函数 | 说明 |
 |------|------|
-| `register_triton_attention(name="triton_gqa")` | 注册到 `ALL_ATTENTION_FUNCTIONS[name]` |
+| `register_triton_attention(name="triton_gqa")` | 通过公共 `AttentionInterface.register()` API 注册 |
 | `triton_gqa_attention(module, q, k, v, attention_mask, *, scaling, sliding_window, ...)` | adapter 本体 |
 | `patch_transformers_5_5_4_flash_attn_key()` | transformers 5.5.4 `KeyError: 'flash_attn'` bug 的 workaround |
 
